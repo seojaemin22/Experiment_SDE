@@ -23,12 +23,8 @@ class FourierEmbs(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        kernel = self.param(
-            "kernel", jax.nn.initializers.normal(self.config.emb_scale), (x.shape[-1], self.config.emb_dim // 2)
-        )
-        y = jnp.concatenate(
-            [jnp.cos(jnp.dot(x, kernel)), jnp.sin(jnp.dot(x, kernel))], axis=-1
-        )
+        kernel = self.param("kernel", jax.nn.initializers.normal(self.config.emb_scale), (x.shape[-1], self.config.emb_dim // 2))
+        y = jnp.concatenate([jnp.cos(jnp.dot(x, kernel)), jnp.sin(jnp.dot(x, kernel))], axis=-1)
         return y
 
 # --------------------------------------------------
@@ -49,6 +45,8 @@ class PINNs(nn.Module):
             self.activation = nn.tanh
         elif self.config.activation == 'swish':
             self.activation = nn.swish
+        elif self.config.activation == 'leaky_relu':
+            self.activation = nn.leaky_relu
         else:
             raise Exception("Activation '" + self.config.activation + "' Not Implemented")
 

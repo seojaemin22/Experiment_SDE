@@ -19,6 +19,7 @@ class Config():
     skip_conn: bool = True
     save_layers: tuple = (0,2,4,6)
     skip_layers: tuple = (2,4,6,8)
+    periodic: bool = False
 
     # Training Def
     batch: int = 256
@@ -38,19 +39,46 @@ class Config():
 
     # BSDE Loss Def  ( + pde iteration )
     traj_len: int = 50
+    dt: float = 0.02
     reset_u: bool = True
     skip_len: int = 5
- 
+    
+    # Save and Load
+    save_model: bool = True
+    save_opt: bool = False
+    model_state: str = 'address'
+    opt_state: str = 'address'
+
+    # Track another loss
+    track_pinns_loss: bool = False
+
     # Extras
     project_name: str = 'BSDE_workspace'
     run_name: str = 'test'
     save_to_wandb: bool = True
     num_figures: int = 10
-    track_pinns_loss: bool = False
-    track_fspinns_loss: bool = False
-    track_bsde_loss: bool = False
-    track_bsde_heun_loss: bool = False
     checkpointing: bool = False
     analytic_sol: bool = True
     custom_eval: bool = False
-    periodic: bool = False
+
+
+@dataclass
+class PDE_Config(Config):
+    # Track another loss
+    track_fspinns_loss: bool = False
+    track_bsde_loss: bool = False
+    track_bsde_heun_loss: bool = False
+
+@dataclass
+class PIDE_Config(Config):
+    # Problem Def
+    mu_n: int = 2
+    mu_phi: float = 0.01
+    sigma_phi: float = 0.1
+    lambda_: float = 0.3
+    epsilon: float = 0.01
+    tau: float = 0.1
+
+    # Track another loss
+    track_fspinns_loss: bool = False
+    track_bsde_loss: bool = False
