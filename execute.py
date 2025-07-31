@@ -8,13 +8,24 @@ if use_float64:
     jax.config.update('jax_enable_x64', True)
 
 case = 'HD_PIDE'
+# output_type = 'FO'
+output_type = 'None'
+
 Case_Solver = None
 if case == 'HJB':
-    Case_Solver = HJB_Solver
-    Case_Controller = PDE_Controller
+    if output_type == 'FO':
+        Case_Solver = HJB_FO_Solver
+        Case_Controller = PDE_FO_Controller
+    else:
+        Case_Solver = HJB_Solver
+        Case_Controller = PDE_Controller
 elif case == 'BSB':
-    Case_Solver = BSB_Solver
-    Case_Controller = PDE_Controller
+    if output_type == 'FO':
+        Case_Solver = BSB_FO_Solver
+        Case_Controller = PDE_FO_Controller
+    else:
+        Case_Solver = BSB_Solver
+        Case_Controller = PDE_FO_Controller
 elif case == 'BZ':
     Case_Solver = BZ_Solver
     Case_Controller = PDE_Controller
@@ -32,16 +43,17 @@ changed_settings = [[batch, 'bsde']]
 for micro_batch, loss_method in changed_settings:
     config.d_in = 100
     config.d_hidden = 256
-    config.num_layers = 2
-    config.activation = 'leaky_relu'
+    config.num_layers = 5
+    config.activation = 'sin'
     config.four_emb = False
-    config.skip_conn = False
+    config.skip_conn = True
     config.save_layers = (0,2)
     config.skip_layers = (2,4)
 
     config.batch = batch
     config.micro_batch = micro_batch
     config.optim = 'adam'
+    # config.lr = 5e-4
     config.lr = 5e-4
     config.iter = 30000
     config.loss_method = loss_method
@@ -67,12 +79,13 @@ for micro_batch, loss_method in changed_settings:
     # config.track_bsde_loss = True
     # config.track_bsde_heun_loss = False
 
-    config.project_name = 'PIDE_workspace'
-    config.run_name = f'test_{loss_method}_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+    config.project_name = 'HD_PIDE'
+    config.run_name = f'5_skip_sin'
+    # config.run_name = f'error_test_{loss_method}_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
     num_figures: int = 20
     config.checkpointing = True
 
-    seed = 202260744
+    seed = 20226074
     svr = Case_Solver(config)
     ctr = Case_Controller(svr, seed=seed)
     ctr.solve()

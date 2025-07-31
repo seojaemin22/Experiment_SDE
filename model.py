@@ -47,6 +47,8 @@ class PINNs(nn.Module):
             self.activation = nn.swish
         elif self.config.activation == 'leaky_relu':
             self.activation = nn.leaky_relu
+        elif self.config.activation == 'sigmoid':
+            self.activation = nn.sigmoid
         else:
             raise Exception("Activation '" + self.config.activation + "' Not Implemented")
 

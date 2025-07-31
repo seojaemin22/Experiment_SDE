@@ -11,8 +11,6 @@ import copy
 # --------------------------------------------------
 
 class HJB_Solver(PDE_Solver):
-    def __init__(self, config: Config):
-        super().__init__(config)
 
     def get_base_config():
         return PDE_Config(case = "HJB")
@@ -47,11 +45,44 @@ class HJB_Solver(PDE_Solver):
         loss = jnp.mean((ut[..., 0] + jnp.trace(uxx, axis1=-2, axis2=-1) - jnp.sum(ux**2, axis=-1))**2)
         return loss
 
+class HJB_FO_Solver(PDE_FO_Solver):
 
+    def get_base_config():
+        return PDE_Config(case = "HJB")
+    
+    def sample_domain(self, key, batch_size):
+        t_pde = jax.random.uniform(key.newkey(), (batch_size, 1), minval=0, maxval=1)
+        x_pde = jnp.sqrt(2) * jax.random.normal(key.newkey(), (batch_size, self.config.d_in))
+        return t_pde, x_pde
+    
+    def analytic_u(self, t, x):
+        w = jnp.sqrt(1-t) * jax.random.normal(jax.random.key(10), (50000, self.config.d_in))
+        return -jnp.log(jnp.mean(jnp.exp(-self.bc_fn(x + jnp.sqrt(2)*w)), axis=0))
+    
+    def get_analytic_X(self, T, W):
+        return self.get_X0(T.shape[0])[:, jnp.newaxis, :] + jnp.sqrt(2.0)*W
+
+    def bc_fn(self, x):
+        return jnp.log(0.5 * (1 + jnp.sum(x**2, keepdims=True, axis=-1)))
+    
+    def b(self, t, x, y=None, z=None):
+        return super().b(t, x, y, z)
+
+    def sigma(self, t, x, y=None, z=None):
+        return jnp.sqrt(2) * super().sigma(t, x, y, z)
+    
+    def h(self, t, x, y, z):
+        return jnp.sum(z**2, axis=-1)
+    
+    def pinns_pde_loss(self, params, t, x):
+        _, ux, uxx = self.calc_uxx(params, t, x)
+        _, ut = self.calc_ut(params, t, x)
+        loss = jnp.mean((ut[..., 0] + jnp.trace(uxx, axis1=-2, axis2=-1) - jnp.sum(ux**2, axis=-1))**2)
+        return loss
+
+# ------------------------------------
 
 class BSB_Solver(PDE_Solver):
-    def __init__(self, config: Config):
-        super().__init__(config)
 
     def get_base_config():
         return PDE_Config(case = "BSB")
@@ -100,8 +131,58 @@ class BSB_Solver(PDE_Solver):
         loss = jnp.mean((ut[..., 0] + 0.5*jnp.trace(self.sigma(t, x, u)**2 @ uxx[..., 0, :, :], axis1=-2, axis2=-1)[..., jnp.newaxis]
                          -0.05*(u - jnp.matmul(ux, x[..., jnp.newaxis])[...,0]))**2)
         return loss
-
     
+class BSB_FO_Solver(PDE_FO_Solver):
+
+    def get_base_config():
+        return PDE_FO_Config(case = "BSB")
+    
+    def sample_domain(self, key, batch_size):
+        t_pde = jax.random.uniform(key.newkey(), (batch_size, 1), minval=0, maxval=1)
+        x_pde = 0.75 + jax.random.normal(key.newkey(), (batch_size, self.config.d_in))
+        return t_pde, x_pde
+    
+    def get_X0(self, batch_size):
+        X0 = []
+        for i in range(self.config.d_in):
+            if i%2 == 1:
+                X0.append(jnp.ones((batch_size, 1))/2)
+            else:
+                X0.append(jnp.ones((batch_size, 1)))
+        return jnp.concatenate(X0, axis=-1)
+    
+    def get_analytic_X(self, T, W):
+        return self.get_X0(T.shape[0])[:, jnp.newaxis, :] * jnp.exp(0.4*W - 0.08*T)
+
+    def analytic_u(self, t, x):
+        return jnp.exp((0.05 + 0.4**2)*(1-t)) * self.bc_fn(x)
+
+    def bc_fn(self, x):
+        return jnp.sum(x**2, keepdims=True, axis=-1)
+    
+    def b(self, t, x, y=None, z=None):
+        return super().b(t, x, y, z)
+    
+    def sigma(self, t, x, y=None, z=None):
+        return 0.4 * jax.vmap(jnp.diag, in_axes=0)(x)
+    
+    def h(self, t, x, y, z):
+        return 0.05 * (y - jnp.matmul(z, x[...,jnp.newaxis])[..., 0])
+    
+    def b_heun(self, t, x, y=None, z=None):
+        return -0.5 * 0.4**2 * x
+    
+    def c(self, t, x, u, ux, uxx):
+        return 0.5 * 0.4**2 * (jnp.matmul(ux, x[...,jnp.newaxis])[...,0] + jnp.trace(jnp.matmul(jax.vmap(jnp.diag)(x**2), uxx[:, 0]), axis1=-1, axis2=-2)[..., jnp.newaxis])
+    
+    def pinns_pde_loss(self, params, t, x):
+        u, ux, uxx = self.calc_uxx(params, t, x)
+        _, ut = self.calc_ut(params, t, x)
+        loss = jnp.mean((ut[..., 0] + 0.5*jnp.trace(self.sigma(t, x, u)**2 @ uxx[..., 0, :, :], axis1=-2, axis2=-1)[..., jnp.newaxis]
+                         -0.05*(u - jnp.matmul(ux, x[..., jnp.newaxis])[...,0]))**2)
+        return loss
+
+# ------------------------------------
 
 class BZ_Solver(PDE_Solver):
     def __init__(self, config: Config):

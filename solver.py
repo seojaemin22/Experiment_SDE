@@ -39,7 +39,7 @@ class Solver():
     def select_loss(self, loss_method):
         if loss_method == 'pinns':
             return self.pinns_grad_batch if self.config.micro_batch < self.config.batch else self.pinns_grad
-        if loss_method == 'regress':
+        elif loss_method == 'regress':
             return self.reg_grad  # Always full micro-batch
         else:
             raise Exception("Loss Method '" + loss_method + "' Not Implemented")
@@ -131,31 +131,25 @@ class Solver():
 
     def calc_ut(self, params, t, x):
         def t_func(t, x):
-            model_fn = lambda t: self.model.apply(params, t, x)
+            model_fn = lambda tt: self.calc_u(params, tt, x)
             u, du_dt = jax.vjp(model_fn, t)
             ut = jax.vmap(du_dt, in_axes=0)(jnp.eye(len(u)))[0]
             return u, ut
         return jax.vmap(t_func, in_axes=(0,0))(t, x)
     
-    def calc_ux(self, params, t, x, output_pos=(0,)):
+    def calc_ux(self, params, t, x):
         def jacrev(t, x):
-            def func(x):
-                u = self.model.apply(params, t, x)
-                u = u[..., output_pos]
-                return u
-            u, vjp_fun = jax.vjp(func, x)
+            model_fn = lambda xx: self.calc_u(params, t, xx)
+            u, vjp_fun = jax.vjp(model_fn, x)
             ux = jax.vmap(vjp_fun, in_axes=0)(jnp.eye(len(u)))[0]
             return u, ux
         return jax.vmap(jacrev, in_axes=0)(t, x)
     
-    def calc_uxx(self, params, t, x, output_pos=(0,)):
+    def calc_uxx(self, params, t, x):
         def jacrev2(t, x):
-            def func(x):
-                u = self.model.apply(params, t, x)
-                u = u[..., output_pos]
-                return u
+            model_fn = lambda xx: self.calc_u(params, t, xx)
             def jacrev(x):
-                u, vjp_fun = jax.vjp(func, x)
+                u, vjp_fun = jax.vjp(model_fn, x)
                 ux = jax.vmap(vjp_fun, in_axes=0)(jnp.eye(len(u)))[0]
                 return ux, u
             func2 = lambda s: jax.jvp(jacrev, (x,), (s,), has_aux=True)
@@ -175,7 +169,7 @@ class Solver():
 
     def analytic_ut(self, t, x):
         def t_func(t, x):
-            model_fn = lambda t: self.analytic_u(t, x)
+            model_fn = lambda tt: self.analytic_u(tt, x)
             u, du_dt = jax.vjp(model_fn, t)
             ut = jax.vmap(du_dt, in_axes=0)(jnp.eye(len(u)))[0]
             return u, ut
@@ -183,25 +177,23 @@ class Solver():
 
     def analytic_ux(self, t, x, output_pos=(0,)):
         def jacrev(t, x):
-            def func(x):
-                u = self.analytic_u(t, x)
-                u = u[..., output_pos]
-                return u
-            u, vjp_fun = jax.vjp(func, x)
+            model_fn = lambda xx: self.analytic_u(t, xx)
+            u, vjp_fun = jax.vjp(model_fn, x)
             ux = jax.vmap(vjp_fun, in_axes=0)(jnp.eye(len(u)))[0]
             return u, ux
         return jax.vmap(jacrev, in_axes=0)(t, x)
     
     def analytic_uxx(self, t, x, output_pos=(0,)):
-        def jacrev(t, x):
-            def func(x):
-                u = self.analytic_u(t, x)
-                u = u[..., output_pos]
-                return u
-            u, vjp_fun = jax.vjp(func, x)
-            ux = jax.vmap(vjp_fun, in_axes=0)(jnp.eye(len(u)))[0]
-            return u, ux
-        return jax.vmap(jacrev, in_axes=0)(t, x)
+        def jacrev2(t, x):
+            model_fn = lambda xx: self.analytic_u(t, xx)
+            def jacrev(x):
+                u, vjp_fun = jax.vjp(model_fn, x)
+                ux = jax.vmap(vjp_fun, in_axes=0)(jnp.eye(len(u)))[0]
+                return ux, u
+            func2 = lambda s: jax.jvp(jacrev, (x,), (s,), has_aux=True)
+            ux, uxx, u = jax.vmap(func2, in_axes=1, out_axes=(None,1,None))(jnp.eye(len(x)))
+            return u, ux, uxx
+        return jax.vmap(jacrev2, in_axes=(0,0))(t, x)
 
     b_y = False
     b_z = False
@@ -411,6 +403,7 @@ class Controller():
         self.params, self.opt_state = self.solver.init_solver(self.key)
 
     def step(self, i):
+        self.key.newkey()
         loss, losses, self.params, self.opt_state, self.key = self.solver.optimize(self.key, self.params, self.opt_state)
 
         if self.solver.config.save_to_wandb:
@@ -861,6 +854,7 @@ class PDE_Solver(Solver):
 class PDE_Controller(Controller):
 
     def step(self, i):
+        self.key.newkey()
         loss, losses, self.params, self.opt_state, self.key = self.solver.optimize(self.key, self.params, self.opt_state)
 
         if self.solver.config.save_to_wandb:
@@ -888,6 +882,485 @@ class PDE_Controller(Controller):
                     self.solver.plot_pred(self.params, i)
                 if self.solver.config.custom_eval:
                     self.solver.plot_eval(self.params, i)
+
+
+
+
+
+# --------------------------------------------------
+# FO-PINN based PDE Solver
+# --------------------------------------------------
+
+class PDE_FO_Solver(PDE_Solver):
+
+    def get_base_config():
+        return PDE_FO_Config()
+    
+    def __init__(self, config: PDE_FO_Config):
+        self.config = copy.deepcopy(config)
+        self.config.d_out = self.config.d_out + 1 + self.config.d_in
+
+        self.loss_fn = self.select_loss(self.config.loss_method)
+        self.model = self.create_model()
+        self.optimizer = self.create_opt()
+        if self.config.analytic_sol:
+            self.sol_T, self.sol_X, self.sol_U = self.get_analytic_sol()
+        if self.config.custom_eval:
+            self.eval_point = self.get_eval_point()
+        if self.config.save_to_wandb:
+            self.init_wandb()
+    
+    def select_loss(self, loss_method):
+        if loss_method == 'pinns':
+            return self.pinns_grad_batch if self.config.micro_batch < self.config.batch else self.pinns_grad
+        elif loss_method == 'fspinns':
+            return self.fspinns_grad_batch if self.config.micro_batch < self.config.batch else self.fspinns_grad
+        elif loss_method == 'bsde':
+            return self.bsde_grad_batch if self.config.micro_batch < self.config.batch else self.bsde_grad
+        elif loss_method == 'bsdeheun':
+            return self.bsde_heun_grad_batch if self.config.micro_batch < self.config.batch else self.bsde_heun_grad
+        else:
+            raise Exception("Loss Method '" + loss_method + "' Not Implemented")
+    
+
+    # --------------------------------------------------
+    # Calculation Methods
+    # --------------------------------------------------
+
+    def calc_u(self, params, t, x):
+        return self.model.apply(params, t, x)[..., :(self.config.d_out-self.config.d_in-1)]
+    
+    def calc_ut(self, params, t, x):
+        u = self.model.apply(params, t, x)
+        return u[..., :(self.config.d_out-self.config.d_in-1)], u[..., (self.config.d_out-self.config.d_in-1):(self.config.d_out-self.config.d_in)]
+
+    def calc_ux(self, params, t, x):
+        u = self.model.apply(params, t, x)
+        return u[..., :(self.config.d_out-self.config.d_in-1)], u[..., (self.config.d_out-self.config.d_in):]
+    
+    def calc_uxx(self, params, t, x):
+        def jacrev2(t, x):
+            def jacrev(x):
+                real_u = self.model.apply(params, t, x)
+                u = real_u[..., :(self.config.d_out-self.config.d_in-1)]
+                ux = real_u[..., jnp.newaxis, (self.config.d_out-self.config.d_in):]
+                return ux, u
+            func2 = lambda s: jax.jvp(jacrev, (x,), (s,), has_aux=True)
+            ux, uxx, u = jax.vmap(func2, in_axes=1, out_axes=(None,1,None))(jnp.eye(len(x)))
+            return u, ux, uxx
+        return jax.vmap(jacrev2, in_axes=(0,0))(t, x)
+    
+    def real_calc_ut(self, params, t, x):
+        def t_func(t, x):
+            model_fn = lambda tt: self.calc_u(params, tt, x)
+            u, du_dt = jax.vjp(model_fn, t)
+            ut = jax.vmap(du_dt, in_axes=0)(jnp.eye(len(u)))[0]
+            return u, ut
+        return jax.vmap(t_func, in_axes=(0,0))(t, x)
+    
+    def real_calc_ux(self, params, t, x):
+        def jacrev(t, x):
+            model_fn = lambda xx: self.calc_u(params, t, xx)
+            u, vjp_fun = jax.vjp(model_fn, x)
+            ux = jax.vmap(vjp_fun, in_axes=0)(jnp.eye(len(u)))[0]
+            return u, ux
+        return jax.vmap(jacrev, in_axes=0)(t, x)
+    
+    def real_calc_uxx(self, params, t, x):
+        def jacrev2(t, x):
+            model_fn = lambda xx: self.calc_u(params, t, xx)
+            def jacrev(x):
+                u, vjp_fun = jax.vjp(model_fn, x)
+                ux = jax.vmap(vjp_fun, in_axes=0)(jnp.eye(len(u)))[0]
+                return ux, u
+            func2 = lambda s: jax.jvp(jacrev, (x,), (s,), has_aux=True)
+            ux, uxx, u = jax.vmap(func2, in_axes=1, out_axes=(None,1,None))(jnp.eye(len(x)))
+            return u, ux, uxx
+        return jax.vmap(jacrev2, in_axes=(0,0))(t, x)
+    
+
+    # --------------------------------------------------
+    # Loss Methods
+    # --------------------------------------------------
+
+    def compat_loss(self, params, t, x):
+        _, ux = self.calc_ux(params, t, x)
+        _, real_ux = self.real_calc_ux(params, t, x)
+        return jnp.mean((ux - real_ux)**2)
+    
+    # ------------------------------
+
+    def pinns_pde_loss(self, params, t, x):
+        pass
+
+    def pinns_pde(self, key, params):
+        num_traj = self.config.batch
+        traj_len = self.config.traj_len
+        
+        t_pde, x_pde = self.sample_domain(key, num_traj * traj_len)
+        return self.pinns_pde_loss(params, t_pde, x_pde), self.compat_loss(params, t_pde, x_pde)
+
+    def pinns_bc(self, key, params):
+        t_bc, x_bc = self.sample_domain(key, self.config.batch)
+        t_bc = jnp.ones_like(t_bc)
+
+        u, ux = self.calc_ux(params, t_bc, x_bc)
+        bc_loss = jnp.mean((u - self.bc_fn(x_bc))**2) + jnp.mean((ux - self.calc_bcx(x_bc))**2)
+        return bc_loss, self.compat_loss(params, t_bc, x_bc)
+
+    def pinns_loss(self, key, params):
+        pde_loss, comp_domain_loss = self.pinns_pde(key, params) 
+        bc_loss, comp_bc_loss = self.pinns_bc(key, params) * self.config.bc_scale
+        pde_loss = pde_loss * self.config.pde_scale
+        bc_loss = bc_loss * self.config.bc_scale
+        comp_loss = (comp_domain_loss + comp_bc_loss) * self.config.comp_scale
+        return pde_loss + bc_loss + comp_loss, (pde_loss, bc_loss, comp_loss)
+
+    def pinns_grad(self, key, params):
+        (total, (pde_loss, bc_loss, comp_loss)), grad = jax.value_and_grad(self.pinns_loss, argnums=1, has_aux=True)(key, params)
+        return (pde_loss, bc_loss, comp_loss), grad
+
+    @partial(jax.jit, static_argnums=0)
+    def jit_pinns_loss(self, key, params):
+        return self.pinns_loss(key, params)[0]
+    
+
+    def pinns_pde_grad_batch(self, key, params):
+        num_traj = self.config.batch
+        micro_batch = self.config.micro_batch
+        n_chunks = (num_traj + micro_batch - 1) // micro_batch
+        traj_len = self.config.traj_len
+
+        grad_make_pde_loss = jax.jit(jax.value_and_grad(lambda pp, tt, xx: jnp.sum(self.pinns_pde_loss(pp, tt, xx))/n_chunks * self.config.pde_scale, argnums=0))
+        grad_make_comp_loss = jax.jit(jax.value_and_grad(lambda pp, tt, xx: jnp.sum(self.compat_loss(pp, tt, xx))/n_chunks * self.config.comp_scale, argnums=0))
+
+        def chunk_loop(carry, _):
+            key, pde_loss_acc, comp_loss_acc, grad_acc = carry
+            t_pde, x_pde = self.sample_domain(key, micro_batch*traj_len)
+            pde_loss, pde_grad = grad_make_pde_loss(params, t_pde, x_pde)
+            comp_loss, comp_grad = grad_make_comp_loss(params, t_pde, x_pde)
+
+            pde_loss_acc = pde_loss_acc + pde_loss
+            comp_loss_acc = comp_loss_acc + comp_loss
+            grad_acc = jax.tree_util.tree_map(lambda a, b, c: a+b+c, grad_acc, pde_grad, comp_grad)
+            return (key, pde_loss_acc, comp_loss_acc, grad_acc), None
+
+        (key, pde_loss, comp_loss, pde_grad), _ = jax.lax.scan(chunk_loop, (key, 0.0, 0.0, jax.tree_util.tree_map(jnp.zeros_like, params)), None, length=n_chunks)
+        return (pde_loss, comp_loss), pde_grad
+    
+    def pinns_grad_batch(self, key, params):
+        pde_loss, comp_domain_loss, pde_grad = self.pinns_pde_grad_batch(key, params) 
+        bc_loss, comp_bc_loss, bc_grad = jax.value_and_grad(self.pinns_bc, argnums=1)(key, params) 
+        grad = jax.tree_util.tree_map(lambda a, b: a+b, pde_grad, bc_grad)
+        comp_loss = comp_domain_loss + comp_bc_loss
+        return (pde_loss, bc_loss, comp_loss), grad
+    
+    # ------------------------------
+
+    def fspinns_loss(self, key, params):
+        num_traj = self.config.batch
+        traj_len = self.config.traj_len
+        dt = self.config.dt
+
+        T = jnp.repeat(jnp.linspace(0, 1, traj_len+1)[jnp.newaxis, ..., jnp.newaxis], num_traj, axis=0)
+        dW = jnp.sqrt(dt) * jnp.concatenate((jnp.zeros((num_traj, 1, self.config.d_in)),
+                                             jax.random.normal(key.newkey(), (num_traj, traj_len, self.config.d_in))), axis=1)
+        X = jnp.zeros((num_traj, traj_len+1, self.config.d_in))
+        X = X.at[:, 0, :].set(self.get_X0(num_traj))
+
+        def loop(i, X):
+            yz_dict = {}
+            if self.b_z or self.sigma_z:
+                yz_dict['y'], yz_dict['z'] = self.calc_ux(params, T[:, i-1, :], X[:, i-1, :])
+            elif self.b_y or self.sigma_y:
+                yz_dict['y'] = self.calc_u(params, T[:, i-1, :], X[:, i-1, :])
+            X = X.at[:, i, :].set(X[:, i-1, :] + self.b(T[:, i-1, :], X[:, i-1, :], **yz_dict)*dt + jnp.matmul(self.sigma(T[:, i-1, :], X[:, i-1, :], **yz_dict), dW[:, i, :, jnp.newaxis])[..., 0])
+            return X
+        
+        X = jax.lax.fori_loop(1, self.config.traj_len+1, loop, X)
+        pde_loss = self.pinns_pde_loss(params, T.reshape(-1, 1), X.reshape(-1, self.config.d_in))
+        bc, bcx = self.calc_ux(params, T[:, -1, :], X[:, -1, :])
+        bc_loss = (jnp.mean((bc - self.bc_fn(X[:, -1, :]))**2) + jnp.mean((bcx - self.calc_bcx(X[:, -1, :]))**2)) * self.config.bc_scale
+        comp_loss = self.compat_loss(params, T.reshape(-1, 1), X.reshape(-1, self.config.d_in)) * self.config.comp_scale
+        return pde_loss + bc_loss + comp_loss, (pde_loss, bc_loss, comp_loss)
+
+    def fspinns_grad(self, key, params):
+        (total, (pde_loss, bc_loss, comp_loss)), grad = jax.value_and_grad(self.fspinns_loss, argnums=1, has_aux=True)(key, params)
+        return (pde_loss, bc_loss, comp_loss), grad
+
+    @partial(jax.jit, static_argnums=0)
+    def jit_fspinns_loss(self, key, params):
+        return self.fspinns_loss(key, params)[0]
+    
+
+    def fspinns_grad_batch(self, key, params):
+        num_traj = self.config.batch
+        micro_batch = self.config.micro_batch
+        n_chunks = (num_traj + micro_batch - 1) // micro_batch
+        traj_len = self.config.traj_len
+        dt = self.config.dt
+
+        def make_loss(key, params):
+            T = jnp.repeat(jnp.linspace(0, 1, traj_len+1)[jnp.newaxis, ..., jnp.newaxis], micro_batch, axis=0)
+            dW = jnp.sqrt(dt) * jnp.concatenate((jnp.zeros((micro_batch, 1, self.config.d_in)),
+                                                 jax.random.normal(key.newkey(), (micro_batch, traj_len, self.config.d_in))), axis=1)
+            X = jnp.zeros((micro_batch, traj_len+1, self.config.d_in))
+            X = X.at[:, 0, :].set(self.get_X0(micro_batch))
+
+            def loop(i, X):
+                yz_dict = {}
+                if self.b_z or self.sigma_z:
+                    yz_dict['y'], yz_dict['z'] = self.calc_ux(params, T[:, i-1, :], X[:, i-1, :])
+                elif self.b_y or self.sigma_y:
+                    yz_dict['y'] = self.calc_u(params, T[:, i-1, :], X[:, i-1, :])
+                X = X.at[:, i, :].set(X[:, i-1, :] + self.b(T[:, i-1, :], X[:, i-1, :], **yz_dict)*dt + jnp.matmul(self.sigma(T[:, i-1, :], X[:, i-1, :], **yz_dict), dW[:, i, :, jnp.newaxis])[..., 0])
+                return X
+            
+            X = jax.lax.fori_loop(1, traj_len+1, loop, X)
+            pde_loss = self.pinns_pde_loss(params, T.reshape(-1, 1), X.reshape(-1, self.config.d_in)) * self.config.pde_scale
+            bc, bcx = self.calc_ux(params, T[:, -1, :], X[:, -1, :])
+            bc_loss = (jnp.mean((bc - self.bc_fn(X[:, -1, :]))**2) + jnp.mean((bcx - self.calc_bcx(X[:, -1, :]))**2)) * self.config.bc_scale
+            comp_loss = self.compat_loss(params, T.reshape(-1, 1), X.reshape(-1, self.config.d_in)) * self.config.comp_scale
+            return pde_loss + bc_loss + comp_loss, (pde_loss, bc_loss, comp_loss)
+
+        grad_make_loss = jax.jit(jax.value_and_grad(make_loss, argnums=1, has_aux=True))
+
+        def chunk_loop(carry, _):
+            key, pde_loss_acc, bc_loss_acc, comp_loss_acc, grad_acc = carry
+            (total, (pde_loss, bc_loss, comp_loss)), grad = grad_make_loss(key, params)
+            pde_loss_acc = pde_loss_acc + pde_loss
+            bc_loss_acc = bc_loss_acc + bc_loss
+            comp_loss_acc = comp_loss_acc + comp_loss
+            grad_acc = jax.tree_util.tree_map(lambda a, b: a+b, grad_acc, grad)
+            return (key, pde_loss_acc, bc_loss_acc, comp_loss_acc, grad_acc), None
+
+        (key, pde_loss, bc_loss, comp_loss, grad), _ = jax.lax.scan(chunk_loop, (key, 0.0, 0.0, 0.0, jax.tree_util.tree_map(jnp.zeros_like, params)), None, length=n_chunks)
+        return (pde_loss, bc_loss, comp_loss), grad
+
+    # --------------------------------------------------
+
+    def bsde_loss(self, key, params):
+        num_traj = self.config.batch
+        traj_len = self.config.traj_len
+        dt = self.config.dt
+        
+        t = jnp.zeros((num_traj, 1))
+        x = self.get_X0(num_traj)
+        u, ux = self.calc_ux(params, t, x)
+        step_loss = jnp.zeros(traj_len)
+        step_comp_loss = jnp.zeros(traj_len)
+
+        def traj_calc(i, inputs):
+            key, t, x, u, ux, step_loss, step_comp_loss = inputs
+            _, real_ux = self.real_calc_ux(params, t, x)
+            step_comp_loss = step_comp_loss.at[i].set(jnp.sum((ux - real_ux)**2))
+
+            sigma = self.sigma(t, x, u, ux)
+            dw = jnp.sqrt(dt) * jax.random.normal(key.newkey(), (num_traj, self.config.d_in))
+            t_new = t + dt
+            x_new = x + self.b(t, x, u, ux)*dt + jnp.matmul(sigma, dw[..., jnp.newaxis])[..., 0]
+            u_new = u + self.h(t, x, u, ux)*dt + jnp.matmul(jnp.matmul(ux, sigma), dw[..., jnp.newaxis])[..., 0]
+
+            u_calc, ux_calc = self.calc_ux(params, t_new, x_new)
+            step_loss = step_loss.at[i].set(jnp.sum((u_new - u_calc)**2))
+
+            u_next = u_calc if self.config.reset_u else u_new
+            return key, t_new, x_new, u_next, ux_calc, step_loss, step_comp_loss
+
+        key, t, x, u, ux, step_loss, step_comp_loss = jax.lax.fori_loop(0, traj_len, traj_calc, (key, t, x, u, ux, step_loss, step_comp_loss))
+        pde_loss = jnp.sum(step_loss) * self.config.pde_scale 
+        bc_loss = (jnp.sum((u - self.bc_fn(x))**2) + jnp.sum((ux - self.calc_bcx(x))**2)) * self.config.bc_scale
+        bc_comp_loss = self.compat_loss(params, t, x)
+        comp_loss = (jnp.sum(step_comp_loss) + bc_comp_loss) * self.config.comp_scale / traj_len
+        return pde_loss + bc_loss + comp_loss, (pde_loss, bc_loss, comp_loss)
+        
+    def bsde_grad(self, key, params):
+        (total, (pde_loss, bc_loss, comp_loss)), grad = jax.value_and_grad(self.bsde_loss, argnums=1, has_aux=True)(key, params)
+        return (pde_loss, bc_loss, comp_loss), grad
+
+    @partial(jax.jit, static_argnums=0)
+    def jit_bsde_loss(self, key, params):
+        return self.bsde_loss(key, params)[0]
+    
+
+    def bsde_grad_batch(self, key, params):
+        num_traj = self.config.batch
+        micro_batch = self.config.micro_batch
+        n_chunks = (num_traj + micro_batch - 1) // micro_batch
+        traj_len = self.config.traj_len
+        dt = self.config.dt
+        
+        def make_loss(key, params):
+            t = jnp.zeros((micro_batch, 1))
+            x = self.get_X0(micro_batch)
+            u, ux = self.calc_ux(params, t, x)
+            step_loss = jnp.zeros(traj_len)
+            step_comp_loss = jnp.zeros(traj_len)
+
+            def traj_calc(i, inputs):
+                key, t, x, u, ux, step_loss, step_comp_loss = inputs
+                _, real_ux = self.real_calc_ux(params, t, x)
+                step_comp_loss = step_comp_loss.at[i].set(jnp.sum((ux - real_ux)**2))
+
+                sigma = self.sigma(t, x, u, ux)
+                dw = jnp.sqrt(dt) * jax.random.normal(key.newkey(), (micro_batch, self.config.d_in))
+                t_new = t + dt
+                x_new = x + self.b(t, x, u, ux)*dt + jnp.matmul(sigma, dw[..., jnp.newaxis])[..., 0]
+                u_new = u + self.h(t, x, u, ux)*dt + jnp.matmul(jnp.matmul(ux, sigma), dw[..., jnp.newaxis])[..., 0]
+
+                u_calc, ux_calc = self.calc_ux(params, t_new, x_new)
+                step_loss = step_loss.at[i].set(jnp.sum((u_new - u_calc)**2))
+
+                u_next = u_calc if self.config.reset_u else u_new
+                return key, t_new, x_new, u_next, ux_calc, step_loss, step_comp_loss
+
+            key, t, x, u, ux, step_loss, step_comp_loss = jax.lax.fori_loop(0, traj_len, traj_calc, (key, t, x, u, ux, step_loss, step_comp_loss))
+            pde_loss = jnp.sum(step_loss) * self.config.pde_scale
+            bc_loss = (jnp.sum((u - self.bc_fn(x))**2) + jnp.sum((ux - self.calc_bcx(x))**2)) * self.config.bc_scale
+            bc_comp_loss = self.compat_loss(params, t, x)
+            comp_loss = (jnp.sum(step_comp_loss) + bc_comp_loss) * self.config.comp_scale / traj_len
+            return pde_loss + bc_loss + comp_loss, (pde_loss, bc_loss, comp_loss)
+
+        grad_make_loss = jax.jit(jax.value_and_grad(make_loss, argnums=1, has_aux=True))
+
+        def chunk_loop(carry, _):
+            key, pde_loss_acc, bc_loss_acc, comp_loss_acc, grad_acc = carry
+            (total, (pde_loss, bc_loss, comp_loss)), grad = grad_make_loss(key, params)
+            pde_loss_acc = pde_loss_acc + pde_loss
+            bc_loss_acc = bc_loss_acc + bc_loss
+            comp_loss_acc = comp_loss_acc + comp_loss
+            grad_acc = jax.tree_util.tree_map(lambda a, b: a+b, grad_acc, grad)
+            return (key, pde_loss_acc, bc_loss_acc, comp_loss_acc, grad_acc), None
+
+        (key, pde_loss, bc_loss, comp_loss, grad), _ = jax.lax.scan(chunk_loop, (key, 0.0, 0.0, 0.0, jax.tree_util.tree_map(jnp.zeros_like, params)), None, length=n_chunks)
+        return (pde_loss, bc_loss, comp_loss), grad
+
+    # --------------------------------------------------
+
+    def bsde_heun_loss(self, key, params):
+        num_traj = self.config.batch
+        traj_len = self.config.traj_len
+        dt = self.config.dt
+        
+        calc_uxx = jax.checkpoint(self.calc_uxx) if self.config.checkpointing else self.calc_uxx
+
+        t = jnp.zeros((num_traj, 1))
+        x = self.get_X0(num_traj)
+        u, ux, uxx = calc_uxx(params, t, x)
+        step_loss = jnp.zeros(traj_len)
+        step_comp_loss1 = jnp.zeros(traj_len)
+        step_comp_loss2 = jnp.zeros(traj_len)
+        
+        def traj_calc(i, inputs):
+            key, t, x, u, ux, uxx, step_loss, step_comp_loss1, step_comp_loss2 = inputs
+            _, real_ux = self.real_calc_ux(params, t, x)
+            step_comp_loss1 = step_comp_loss1.at[i].set(jnp.sum((ux - real_ux)**2))
+
+            sigma = self.sigma(t, x, u, ux)
+            dw = jnp.sqrt(dt) * jax.random.normal(key.newkey(), (num_traj, self.config.d_in))
+            dx_int = self.b_heun(t, x, u, ux)*dt + jnp.matmul(sigma, dw[..., jnp.newaxis])[..., 0]
+            x_int = x + dx_int
+            du_int = (self.h(t, x, u, ux) - self.c(t, x, u, ux, uxx))*dt + jnp.matmul(jnp.matmul(ux, self.sigma(t, x, u, ux)), dw[..., jnp.newaxis])[..., 0]
+            u_int = u + du_int
+
+            t_new = t + dt
+            _, ux_int, uxx_int = calc_uxx(params, t_new, x_int)
+            _, real_ux_int = self.real_calc_ux(params, t_new, x_int)
+            step_comp_loss2 = step_comp_loss2.at[i].set(jnp.sum((ux_int - real_ux_int)**2))
+            
+            sigma = self.sigma(t_new, x_int, u_int, ux_int)
+            x_new = x + 0.5*dx_int + 0.5*(self.b_heun(t_new, x_int, u_int, ux_int)*dt + jnp.matmul(sigma, dw[..., jnp.newaxis])[..., 0])
+            u_new = u + 0.5*du_int + 0.5*((self.h(t_new, x_int, u_int, ux_int) - self.c(t_new, x_int, u_int, ux_int, uxx_int))*dt + jnp.matmul(jnp.matmul(ux_int, sigma), dw[..., jnp.newaxis])[..., 0])
+            
+            u_calc, ux_calc, uxx_calc = calc_uxx(params, t_new, x_new)
+
+            step_loss = step_loss.at[i].set(jnp.sum((u_new - u_calc)**2))
+            return key, t_new, x_new, u_calc, ux_calc, uxx_calc, step_loss, step_comp_loss1, step_comp_loss2
+
+        key, t, x, u, ux, uxx, step_loss, step_comp_loss1, step_comp_loss2 = jax.lax.fori_loop(0, traj_len, traj_calc, (key, t, x, u, ux, uxx, step_loss, step_comp_loss1, step_comp_loss2))
+        pde_loss = jnp.sum(step_loss) * self.config.pde_scale
+        bc_loss = (jnp.sum((u - self.bc_fn(x))**2) + jnp.sum((ux - self.calc_bcx(x))**2)) * self.config.bc_scale
+        bc_comp_loss = self.compat_loss(params, t, x)
+        comp_loss = (jnp.sum(step_comp_loss1) + jnp.sum(step_comp_loss2) + bc_comp_loss) * self.config.comp_scale / traj_len
+        return pde_loss + bc_loss + comp_loss, (pde_loss, bc_loss, comp_loss)
+
+    def bsde_heun_grad(self, key, params):
+        (total, (pde_loss, bc_loss, comp_loss)), grad = jax.value_and_grad(self.bsde_heun_loss, argnums=1, has_aux=True)(key, params)
+        return (pde_loss, bc_loss, comp_loss), grad
+
+    @partial(jax.jit, static_argnums=0)
+    def jit_bsde_heun_loss(self, key, params):
+        return self.bsde_heun_loss(key, params)[0]
+    
+
+    def bsde_heun_grad_batch(self, key, params):
+        num_traj = self.config.batch
+        micro_batch = self.config.micro_batch
+        n_chunks = (num_traj + micro_batch - 1) // micro_batch
+        traj_len = self.config.traj_len
+        dt = self.config.dt
+
+        calc_uxx = jax.checkpoint(self.calc_uxx) if self.config.checkpointing else self.calc_uxx
+
+        def make_loss(key, params):
+            t = jnp.zeros((micro_batch, 1))
+            x = self.get_X0(micro_batch)
+            u, ux, uxx = calc_uxx(params, t, x)
+            step_loss = jnp.zeros(traj_len)
+            step_comp_loss1 = jnp.zeros(traj_len)
+            step_comp_loss2 = jnp.zeros(traj_len)
+
+            def traj_calc(i, inputs):
+                key, t, x, u, ux, uxx, step_loss, step_comp_loss1, step_comp_loss2 = inputs
+                _, real_ux = self.real_calc_ux(params, t, x)
+                step_comp_loss1 = step_comp_loss1.at[i].set(jnp.sum((ux - real_ux)**2))
+
+                sigma = self.sigma(t, x, u, ux)
+                dw = jnp.sqrt(dt) * jax.random.normal(key.newkey(), (micro_batch, self.config.d_in))
+                dx_int = self.b_heun(t, x, u, ux)*dt + jnp.matmul(sigma, dw[..., jnp.newaxis])[..., 0]
+                x_int = x + dx_int
+                du_int = (self.h(t, x, u, ux) - self.c(t, x, u, ux, uxx))*dt + jnp.matmul(jnp.matmul(ux, self.sigma(t, x, u, ux)), dw[..., jnp.newaxis])[..., 0]
+                u_int = u + du_int
+
+                t_new = t + dt
+                _, ux_int, uxx_int = calc_uxx(params, t_new, x_int)
+                _, real_ux_int = self.real_calc_ux(params, t_new, x_int)
+                step_comp_loss2 = step_comp_loss2.at[i].set(jnp.sum((ux_int - real_ux_int)**2))
+                
+                sigma = self.sigma(t_new, x_int, u_int, ux_int)
+                x_new = x + 0.5*dx_int + 0.5*(self.b_heun(t_new, x_int, u_int, ux_int)*dt + jnp.matmul(sigma, dw[..., jnp.newaxis])[..., 0])
+                u_new = u + 0.5*du_int + 0.5*((self.h(t_new, x_int, u_int, ux_int) - self.c(t_new, x_int, u_int, ux_int, uxx_int))*dt + jnp.matmul(jnp.matmul(ux_int, sigma), dw[..., jnp.newaxis])[..., 0])
+            
+                u_calc, ux_calc, uxx_calc = calc_uxx(params, t_new, x_new)
+
+                step_loss = step_loss.at[i].set(jnp.sum((u_new - u_calc)**2))
+                return key, t_new, x_new, u_calc, ux_calc, uxx_calc, step_loss, step_comp_loss1, step_comp_loss2
+
+            key, t, x, u, ux, uxx, step_loss, step_comp_loss1, step_comp_loss2 = jax.lax.fori_loop(0, traj_len, traj_calc, (key, t, x, u, ux, uxx, step_loss, step_comp_loss1, step_comp_loss2))
+            pde_loss = jnp.sum(step_loss) * self.config.pde_scale
+            bc_loss = (jnp.sum((u - self.bc_fn(x))**2) + jnp.sum((ux - self.calc_bcx(x))**2)) * self.config.bc_scale
+            bc_comp_loss = self.compat_loss(params, t, x)
+            comp_loss = (jnp.sum(step_comp_loss1) + jnp.sum(step_comp_loss2) + bc_comp_loss) * self.config.comp_scale / traj_len
+            return pde_loss + bc_loss + comp_loss, (pde_loss, bc_loss, comp_loss)
+
+        grad_make_loss = jax.jit(jax.value_and_grad(make_loss, argnums=1, has_aux=True))
+
+        def chunk_loop(carry, _):
+            key, pde_loss_acc, bc_loss_acc, comp_loss_acc, grad_acc = carry
+            (total, (pde_loss, bc_loss, comp_loss)), grad = grad_make_loss(key, params)
+            pde_loss_acc = pde_loss_acc + pde_loss
+            bc_loss_acc = bc_loss_acc + bc_loss
+            comp_loss_acc = comp_loss_acc + comp_loss
+            grad_acc = jax.tree_util.tree_map(lambda a, b: a+b, grad_acc, grad)
+            return (key, pde_loss_acc, bc_loss_acc, comp_loss_acc, grad_acc), None
+
+        (key, pde_loss, bc_loss, comp_loss, grad), _ = jax.lax.scan(chunk_loop, (key, 0.0, 0.0, 0.0, jax.tree_util.tree_map(jnp.zeros_like, params)), None, length=n_chunks)
+        return (pde_loss, bc_loss, comp_loss), grad
+
+
+class PDE_FO_Controller(PDE_Controller):
+    pass
+
 
 
 
@@ -1047,7 +1520,7 @@ class PIDE_Solver(Solver):
 
         key, t, x, u, ux, step_loss = jax.lax.fori_loop(0, traj_len, traj_calc, (key, t, x, u, ux, step_loss))
         pde_loss = jnp.sum(step_loss) * self.config.pde_scale 
-        bc_loss = jnp.sum((u - self.bc_fn(x))**2) + jnp.sum((ux - self.calc_bcx(x))**2) * self.config.bc_scale
+        bc_loss = (jnp.sum((u - self.bc_fn(x))**2) + jnp.sum((ux - self.calc_bcx(x))**2)) * self.config.bc_scale
         return pde_loss + bc_loss, (pde_loss, bc_loss)
         
     def bsde_grad(self, key, params):
@@ -1076,7 +1549,7 @@ class PIDE_Solver(Solver):
                 key, t, x, u, ux, step_loss = inputs
 
                 jump_occurence = (jax.random.uniform(key.newkey(), (micro_batch, self.config.mu_n, 1)) < self.lambda_ * dt).astype(float)
-                jump_size = self.config.sigma_phi * (jax.random.normal(key.newkey(), (micro_batch, self.config.mu_n, self.config.d_in)) + self.config.mu_phi)
+                jump_size = self.config.sigma_phi * jax.random.normal(key.newkey(), (micro_batch, self.config.mu_n, self.config.d_in)) + self.config.mu_phi
                 j = jump_size * jump_occurence
 
                 sigma = self.sigma(t, x, u, ux)
@@ -1093,7 +1566,7 @@ class PIDE_Solver(Solver):
 
             key, t, x, u, ux, step_loss = jax.lax.fori_loop(0, traj_len, traj_calc, (key, t, x, u, ux, step_loss))
             pde_loss = jnp.sum(step_loss) * self.config.pde_scale 
-            bc_loss = jnp.sum((u - self.bc_fn(x))**2) + jnp.sum((ux - self.calc_bcx(x))**2) * self.config.bc_scale
+            bc_loss = (jnp.sum((u - self.bc_fn(x))**2) + jnp.sum((ux - self.calc_bcx(x))**2)) * self.config.bc_scale
             return pde_loss + bc_loss, (pde_loss, bc_loss)
         
         grad_make_loss = jax.jit(jax.value_and_grad(make_loss, argnums=1, has_aux=True))
@@ -1113,6 +1586,7 @@ class PIDE_Solver(Solver):
 class PIDE_Controller(Controller):
 
     def step(self, i):
+        self.key.newkey()
         loss, losses, self.params, self.opt_state, self.key = self.solver.optimize(self.key, self.params, self.opt_state)
 
         if self.solver.config.save_to_wandb:

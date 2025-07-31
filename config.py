@@ -70,6 +70,11 @@ class PDE_Config(Config):
     track_bsde_heun_loss: bool = False
 
 @dataclass
+class PDE_FO_Config(PDE_Config):
+    # PINNS Loss Def
+    comp_scale: float = 1
+
+@dataclass
 class PIDE_Config(Config):
     # Problem Def
     mu_n: int = 2
