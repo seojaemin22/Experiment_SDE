@@ -1,29 +1,23 @@
-import jax
-import matplotlib.pyplot as plt
-import jax.numpy as jnp
-import numpy as onp
+from dataclasses import dataclass
+import jax, jax.numpy as jnp
 
 @jax.tree_util.register_pytree_node_class
 class Key:
-    def __init__(self,key):
+    def __init__(self, key):
         self.key = key
-
-    @classmethod
-    def create_key(cls,seed):
-        temp = cls.__new__(cls)
-        temp.__init__(jax.random.key(seed))
-        return temp
+    
+    def split(self):
+        k1, k2 = jax.random.split(self.key)
+        return Key(k1), k2
+    
+    def split_n(self, n: int):
+        ks = jax.random.split(self.key, n+1)
+        return Key(ks[0]), ks[1:]
     
     # JAX PyTree Definitions
     def tree_flatten(self):
-        children = (self.key,)
-        aux_data = {}
-        return (children,aux_data)
+        return ((self.key,), {})
 
     @classmethod
-    def tree_unflatten(cls,aux_data,children):
-        return cls(*children, **aux_data)
-    
-    def newkey(self):
-        self.key, ret_key = jax.random.split(self.key)
-        return ret_key
+    def tree_unflatten(cls, aux_data, children):
+        return cls(children[0])
