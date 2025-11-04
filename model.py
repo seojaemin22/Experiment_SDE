@@ -20,22 +20,21 @@ def get_activation(activation_name):
     else:
         raise Exception("Activation '" + activation_name + "' Not Implemented")
 
-def get_boundary_function(bc_name):
-    if bc_name == 'HJB_default':
+def get_boundary_function(problem_name, bc_name):
+    name = f'{problem_name}_{bc_name}'
+    if name == 'HJB_default':
         return HJB_default_bc
-    if bc_name == 'HJB_splitting':
-        return HJB_splitting_bc
-    if bc_name == 'BSB_default':
+    elif name == 'BSB_default':
         return BSB_default_bc
     else:
         raise Exception("Boundary Condition '" + bc_name + "' Not Implemented")
 
-def get_model(config: Model_Config):
+def get_model(config: Model_Config, problem_name):
     model_name = config.model_name
 
     if model_name == 'MLP':
         activation = get_activation(config.MLP_activation)
-        boundary_function = get_boundary_function(config.bc_name)
+        boundary_function = get_boundary_function(problem_name, config.bc_name)
         return MLP(config, activation=activation, boundary_function=boundary_function)
     else:
         raise Exception("Model '" + model_name + "' Not Implemented")
@@ -119,9 +118,6 @@ class LeakyReLU(Activation):
 def HJB_default_bc(x):
     return jnp.log(0.5 * (1 + jnp.sum(x**2, keepdims=True, axis=-1)))
 
-def HJB_splitting_bc(x):
-    return jnp.sqrt(jnp.sqrt(jnp.sum(x**2, axis=-1, keepdims=True)))
-
 def BSB_default_bc(x):
     return jnp.sum(x**2, keepdims=True, axis=-1)
 
@@ -134,36 +130,24 @@ class MLP(nn.Module):
 
     def setup(self):
         param_dtype = jnp.float64 if self.config.use_float64 else jnp.float32
-        xavier_init = initializers.glorot_uniform()
         zero_init   = initializers.zeros
-        he_init     = nn.initializers.variance_scaling(2.0, 'fan_in', 'truncated_normal')
 
-        self.momentum = 0.99
-        self.epsilon = 1e-2
-
-        if self.config.use_batch_norm:
-            self.input_batch_norm = nn.BatchNorm(momentum=self.momentum, epsilon=self.epsilon, param_dtype=param_dtype)
-            self.hidden_batch_norms = [nn.BatchNorm(momentum=self.momentum, epsilon=self.epsilon, param_dtype=param_dtype) for _ in range(self.config.MLP_num_layers)]
-            self.output_batch_norm = nn.BatchNorm(momentum=self.momentum, epsilon=self.epsilon, param_dtype=param_dtype)
-        
-        if self.config.kernel_init == 'he':
+        if self.config.MLP_kernel_init == 'he':
+            he_init     = nn.initializers.variance_scaling(2.0, 'fan_in', 'truncated_normal')
             self.layers = [nn.Dense(self.config.MLP_d_hidden, kernel_init=he_init, bias_init=zero_init, param_dtype=param_dtype) for _ in range(self.config.MLP_num_layers)]
             self.output_layer = nn.Dense(self.config.d_out, kernel_init=he_init, bias_init=zero_init, param_dtype=param_dtype)
-        else:
+        else:  # self.config.MLP_kernel_init == 'xavier'
+            xavier_init = initializers.glorot_uniform()
             self.layers = [nn.Dense(self.config.MLP_d_hidden, kernel_init=xavier_init, bias_init=zero_init, param_dtype=param_dtype) for _ in range(self.config.MLP_num_layers)]
             self.output_layer = nn.Dense(self.config.d_out, kernel_init=xavier_init, bias_init=zero_init, param_dtype=param_dtype)
-    
-    def __call__(self, *args, use_running_average: bool = True):
+
+    def __call__(self, *args):
         src = jnp.concatenate(args, axis=-1)
-        if self.config.use_batch_norm:
-            src = self.input_batch_norm(src, use_running_average=use_running_average)
         if self.config.MLP_skip_conn:
             src_skip = jnp.zeros((src.shape[0], self.config.MLP_d_hidden))
             
         for i in range(len(self.layers)):
             src = self.layers[i](src)
-            if self.config.use_batch_norm:
-                src = self.hidden_batch_norms[i](src, use_running_average=use_running_average)
             src = self.activation(src)
             if self.config.MLP_skip_conn:
                 if i in self.config.MLP_save_layers:
@@ -171,14 +155,12 @@ class MLP(nn.Module):
                 if i in self.config.MLP_skip_layers:
                     src = src + src_skip
 
-        if self.config.use_batch_norm:
-            src = self.output_batch_norm(src, use_running_average=use_running_average)
         src = self.output_layer(src)
 
-        if self.config.time_coupled and self.config.use_hard_constraint:
+        if self.config.use_hard_constraint:
             t, x = args
             boundary_value = self.boundary_function(x)
-            return boundary_value + (self.config.T - t)/self.config.T * src
+            return boundary_value + (self.config.T - t) * src
         else:
             return src
 
@@ -211,21 +193,6 @@ class MLP(nn.Module):
             z = jnp.einsum('...i,ih->...h', src, W) + b  # (B, Hout)
             G = jnp.einsum('...jD,jh->...hD', G, W)      # (B, Hout, Din)
             S = jnp.einsum('...j,jh->...h', S, W)        # (B, Hout)
-
-            # Batchnorm layer : z(v) = gamma * (z - mu)/sigma + beta
-            # dz(v) = gamma/sigma * dz(v)
-            # d2z(v) = gamma/sigma * d2z(v)
-            # lap(z(v)) = gamma/sigma * lap(z(v))
-
-            if self.config.use_batch_norm:
-                mean = params['batch_stats'][f'hidden_batch_norms_{i}']['mean']
-                var  = params['batch_stats'][f'hidden_batch_norms_{i}']['var']
-                gamma = params['params'][f'hidden_batch_norms_{i}']['scale']
-                beta  = params['params'][f'hidden_batch_norms_{i}']['bias']
-
-                z = gamma * (z - mean) / jnp.sqrt(var + self.epsilon) + beta
-                G = (gamma / jnp.sqrt(var + self.epsilon))[None, :, None] * G
-                S = (gamma / jnp.sqrt(var + self.epsilon))[None, :] * S
 
             # Activation layer : z(v) = phi(x(v))
             # dz(v) = phi'(x(v)) dx(v)

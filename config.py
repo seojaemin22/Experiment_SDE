@@ -7,7 +7,7 @@ from math import sqrt
 @dataclass
 class Model_Config():
     use_float64: bool = False
-
+    
     # dimensions
     d_in: int = 1  # not including t
     d_out: int = 1
@@ -15,12 +15,11 @@ class Model_Config():
     # method of derivative
     derivative: str = 'backward'  # forward
 
-    # time_dependent, boundary condition
-    time_coupled: bool = True
+    # boundary condition
     use_hard_constraint: bool = False  # if time_coupled is False, this option has no effect
 
     T: float = 1.0
-    bc_name: str = 'HJB_example'
+    bc_name: str = 'default'
     bc_scale: float = 1.0  # if use_hard_constraint = False
 
     # model : MLP
@@ -33,10 +32,7 @@ class Model_Config():
     MLP_skip_conn: bool = True
     MLP_save_layers: tuple = (0,2,4)
     MLP_skip_layers: tuple = (2,4,6)
-    kernel_init : str = 'xavier_init'
-    
-    # normalization
-    use_batch_norm: bool = False
+    MLP_kernel_init : str = 'xavier_init'
     
 
 
@@ -67,21 +63,24 @@ class Solver_Config():
     X0_std: float = 0.0
 
     # loss method
-    # time-coupled model based : fspinns, fbsnn, fbsnnheun, shotgun
-    # time-decoupled model based : bsde, splitting
-    loss_method: str = 'bsde'
+    # fspinns, fbsnn, fbsnnheun, shotgun, nobiasfbsnn, nobiasshotgun
+    loss_method: str = 'fbsnn'
     pde_scale: float = 1.0
+
+    # loss balancing
+    causal_training: bool = False
+    epsilons: list = field(default_factory=lambda: [1e-2, 1e-1, 1.0, 10.0, 100.0])
+    delta: float = 0.99
 
     # shotgun setting
     shotgun_local_batch: int = 64
     shotgun_Delta_t: float = 4**(-5)
-    shotgun_use_traj_loss: bool = False
+
 
     # checkpointing
     checkpointing: bool = False
 
     # evaluation
-    analytic_traj_sol = True
     test_traj_len: int = 100
     custom_eval: bool = False
 
@@ -95,7 +94,8 @@ class Solver_Config():
     project_name: str = 'FBSDE_workspace'
     run_name: str = 'test'
     save_to_wandb: bool = True
-    num_figures: int = 100  # if model is time-decoupled, num_figures can be ignored
+    num_figures: int = 20
+
 
 
 @dataclass
