@@ -76,18 +76,25 @@ class Solver():
         self.sigma = getattr(self, f'{problem_name}_sigma')
         self.h = getattr(self, f'{problem_name}_h')
         self.b_heun = getattr(self, f'{problem_name}_b_heun')  # b + Correction of Forward Stratonovich SDE (- 1/2 sigma sigma_x)
-
-    def c(self, weighted_lap):  # Correction of Backward Stratonovich SDE
-        return 0.5 * weighted_lap
+        self.c = getattr(self, f'{problem_name}_c')
     
     def get_loss(self):
         loss_method = self.solver_config.loss_method
         if loss_method == 'fspinns': return self.fspinns_loss
         elif loss_method == 'fbsnn': return self.fbsnn_loss
         elif loss_method == 'fbsnnheun': return self.fbsnnheun_loss
-        elif loss_method == 'nobiasfbsnn': return self.nobiasfbsnn_loss
+        elif loss_method == 'nobiasfbsnn1': return self.nobiasfbsnn1_loss
+        elif loss_method == 'nobiasfbsnn2': return self.nobiasfbsnn2_loss
+        elif loss_method == 'nobiasfbsnn3': return self.nobiasfbsnn3_loss
+        elif loss_method == 'nobiasfbsnn4': return self.nobiasfbsnn4_loss
+        elif loss_method == 'nobiasfbsnn5': return self.nobiasfbsnn5_loss
+        elif loss_method == 'nobiasfbsnn6': return self.nobiasfbsnn6_loss
         elif loss_method == 'shotgun': return self.shotgun_loss
-        elif loss_method == 'nobiasshotgun': return self.nobiasshotgun_loss
+        elif loss_method == 'nobiasshotgun1': return self.nobiasshotgun1_loss
+        elif loss_method == 'nobiasshotgun2': return self.nobiasshotgun2_loss
+        elif loss_method == 'nobiasshotgun3': return self.nobiasshotgun3_loss
+        elif loss_method == 'nobiasshotgun4': return self.nobiasshotgun4_loss
+        elif loss_method == 'nobiasshotgun5': return self.nobiasshotgun5_loss
         else: raise Exception("Loss Method '" + loss_method + "' Not Implemented")
 
 
@@ -192,6 +199,9 @@ class Solver():
 
     def HJB_b_heun(self, t, x):
         return jnp.zeros_like(x)
+
+    def HJB_c(self, t, x, u, ux, weighted_lap):  # Correction of Backward Stratonovich SDE
+        return 0.5 * weighted_lap
     
     def HJB_pinns_residual(self, params, t, x):
         _, ut, ux = self.calc_ut_ux(params, t, x)
@@ -236,6 +246,9 @@ class Solver():
     
     def BSB_b_heun(self, t, x):
         return -0.5 * 0.4**2 * x
+    
+    def BSB_c(self, t, x, u, ux, weighted_lap):  # Correction of Backward Stratonovich SDE
+        return 0.5 * weighted_lap + 0.5 * 0.4**2 * jnp.matmul(ux, x[..., jnp.newaxis])[..., 0]
     
     def BSB_pinns_residual(self, params, t, x):
         u, ut, ux = self.calc_ut_ux(params, t, x)
@@ -292,7 +305,7 @@ class Solver():
             return u, ux, uxx
         return jax.vmap(u_ux_uxx, in_axes=(0, 0))(t, x)
 
-    def _calc_laplacian(self, apply_fn, params, x, t=None, weight=None):
+    def _calc_laplacian(self, apply_fn, params, t, x, weight=None):
         weight = jnp.broadcast_to(
             weight if weight is not None else jnp.eye(self.model_config.d_in),
             shape=(x.shape[0], self.model_config.d_in, self.model_config.d_in)
@@ -346,26 +359,33 @@ class Solver():
     # Loss Methods  [ time-coupled model ]
     # --------------------------------------------------
 
-    def loss_to_grad(self, loss_fn):
-        def _loss_and_grad(key, params, causal_step):
-            (total, (losses, key, params)), grad = jax.value_and_grad(lambda K, P: loss_fn(K, P, causal_step), argnums=1, has_aux=True)(key, params)
-            return (total, (losses, key, params)), grad
+    # def loss_to_grad(self, loss_fn):
+    #     def _loss_and_grad(key, params, causal_step):
+    #         (total, (losses, key, params)), grad = jax.value_and_grad(lambda K, P: loss_fn(K, P, causal_step), argnums=1, has_aux=True)(key, params)
+    #         return (total, (losses, key, params)), grad
 
-        def grad_fn(key, params, causal_step):
-            n_chunks = (self.solver_config.batch + self.solver_config.micro_batch - 1) // self.solver_config.micro_batch
+    #     def grad_fn(key, params, causal_step):
+    #         n_chunks = (self.solver_config.batch + self.solver_config.micro_batch - 1) // self.solver_config.micro_batch
 
-            def chunk_loop(carry, _):
-                key, params, losses_acc, grad_acc = carry
-                (total, (losses, key, params)), grad = _loss_and_grad(key, params, causal_step)
-                losses_vec = jnp.asarray(losses)
-                losses_acc = losses_acc + losses_vec
-                grad_acc = jax.tree_util.tree_map(lambda a, b: a+b, grad_acc, grad)
-                return (key, params, losses_acc, grad_acc), None
+    #         def chunk_loop(carry, _):
+    #             key, params, losses_acc, grad_acc = carry
+    #             (total, (losses, key, params)), grad = _loss_and_grad(key, params, causal_step)
+    #             losses_vec = jnp.asarray(losses)
+    #             losses_acc = losses_acc + losses_vec
+    #             grad_acc = jax.tree_util.tree_map(lambda a, b: a+b, grad_acc, grad)
+    #             return (key, params, losses_acc, grad_acc), None
             
-            losses_0 = jnp.zeros((len(loss_fn(key, params, causal_step)[1][0]),), dtype=jnp.result_type(0.0))
-            grad_0 = jax.tree_util.tree_map(jnp.zeros_like, params)
-            (key, params, losses, grad), _ = jax.lax.scan(chunk_loop, (key, params, losses_0, grad_0), None, length=n_chunks)
-            return key, params, losses, grad
+    #         losses_0 = jnp.zeros((len(loss_fn(key, params, causal_step)[1][0]),), dtype=jnp.result_type(0.0))
+    #         grad_0 = jax.tree_util.tree_map(jnp.zeros_like, params)
+    #         (key, params, losses, grad), _ = jax.lax.scan(chunk_loop, (key, params, losses_0, grad_0), None, length=n_chunks)
+    #         return key, params, losses, grad
+        
+    #     return grad_fn
+    
+    def loss_to_grad(self, loss_fn):
+        def grad_fn(key, params, epsilon):
+            (total, (losses, key, params, update_weight)), grad = jax.value_and_grad(lambda K, P, E: loss_fn(K, P, E), argnums=1, has_aux=True)(key, params, epsilon)
+            return key, params, losses, grad, update_weight
         
         return grad_fn
         
@@ -432,12 +452,11 @@ class Solver():
 
     def compute_balanced_loss(self, pde_losses, epsilon):
         if self.solver_config.causal_training:
-            weight = jnp.concatenate([jax.lax.stop_gradient(jnp.exp(-epsilon * jnp.cumsum(pde_losses[:-1][::-1])[::-1])), jnp.ones(1)])
-            weight = jnp.where(weight > 0.99, weight, 0.0)
-            jax.debug.print("{}, ..., {}, {}", weight[0], weight[-2], weight[-1])
-            return jnp.sum(weight * pde_losses)                                                                                                             
+            weight = jnp.concatenate([jax.lax.stop_gradient(jnp.exp(-epsilon * jnp.cumsum(pde_losses[1:][::-1])[::-1])), jnp.ones(1)])
+            update_epsilon = weight[0] > self.solver_config.delta_epsilon
+            return jnp.sum(weight * pde_losses), update_epsilon             
         else:
-            return jnp.sum(pde_losses)
+            return jnp.sum(pde_losses), False
 
     # --------------------------------------------------
     # --------------------------------------------------
@@ -486,12 +505,14 @@ class Solver():
 
         key, x_end, u_end, ux_end, traj_loss = jax.lax.fori_loop(0, self.solver_config.traj_len, traj_calc, (key, x_start, u_start, ux_start, traj_loss))
 
-        pde_loss = self.compute_balanced_loss(traj_loss, epsilon=epsilon)
         if self.model_config.use_hard_constraint:
-            return pde_loss, ((pde_loss,), key, params)
+            pde_loss, update_epsilon = self.compute_balanced_loss(traj_loss, epsilon)
+            return pde_loss, ((pde_loss,), key, params, update_epsilon)
         else:
             bc_loss = self.model_config.bc_scale * (jnp.mean((u_end - self.bc_fn(x_end))**2) + jnp.mean((ux_end - self.calc_bcx(x_end))**2))
-            return pde_loss + bc_loss, ((pde_loss, bc_loss), key, params)
+            # bc_loss = self.model_config.bc_scale * jnp.mean((u_end - self.bc_fn(x_end))**2)
+            pde_loss, update_epsilon = self.compute_balanced_loss(jnp.concatenate([traj_loss, bc_loss[None]]), epsilon)
+            return pde_loss, ((pde_loss, bc_loss), key, params, update_epsilon)
 
     # --------------------------------------------------   
 
@@ -509,40 +530,43 @@ class Solver():
             t = T[:, i, :]
             dt = dT[:, i, :]
             sigma = self.sigma(t, x)
-            weighted_lap = self.calc_laplacian(params, x, t, weight=sigma)[1]
+            weighted_lap = self.calc_laplacian(params, t, x, weight=sigma)[1]
 
             key, sub = key.split()
             dw = jnp.sqrt(dt) * jax.random.normal(sub, (batch, self.model_config.d_in))
             
             dx_star = self.b_heun(t, x)*dt + jnp.matmul(sigma, dw[..., jnp.newaxis])[..., 0]
             x_star = x + dx_star
-            du_star = (self.h(t, x, u, ux) - self.c(weighted_lap))*dt + jnp.matmul(jnp.matmul(ux, sigma), dw[..., jnp.newaxis])[..., 0]
-            u_star = u + du_star
+            du_star = (self.h(t, x, u, ux) - self.c(t, x, u, ux, weighted_lap))*dt + jnp.matmul(jnp.matmul(ux, sigma), dw[..., jnp.newaxis])[..., 0]
+            # u_star = u + du_star
 
             t_new = T[:, i+1, :]  # t + dt
-            _, ux_star = self.calc_ux(params, t_new, x_star)
+            u_star, ux_star = self.calc_ux(params, t_new, x_star)
             sigma_star = self.sigma(t_new, x_star)
-            weighted_lap_star = self.calc_laplacian(params, x_star, t_new, weight=sigma_star)[1]
-
+            weighted_lap_star = self.calc_laplacian(params, t_new, x_star, weight=sigma_star)[1]
+# 
             x_new = x + 0.5*dx_star + 0.5*(self.b_heun(t_new, x_star)*dt + jnp.matmul(sigma_star, dw[..., jnp.newaxis])[..., 0])
-            u_new = u + 0.5*du_star + 0.5*((self.h(t_new, x_star, u_star, ux_star) - self.c(weighted_lap_star))*dt + jnp.matmul(jnp.matmul(ux_star, sigma_star), dw[..., jnp.newaxis])[..., 0])
+            u_new = u + 0.5*du_star + 0.5*((self.h(t_new, x_star, u_star, ux_star) - self.c(t_new, x_star, u_star, ux_star, weighted_lap_star))*dt + jnp.matmul(jnp.matmul(ux_star, sigma_star), dw[..., jnp.newaxis])[..., 0])
 
             u_calc, ux_calc = self.calc_ux(params, t_new, x_new)
-            traj_loss = traj_loss.at[i].set(jnp.mean((u_new - u_calc)**2))
+            traj_loss = traj_loss.at[i].set(self.solver_config.pde_scale * jnp.mean((u_new - u_calc)**2))
 
             return key, x_new, u_calc, ux_calc, traj_loss
 
         key, x_end, u_end, ux_end, traj_loss = jax.lax.fori_loop(0, self.solver_config.traj_len, traj_calc, (key, x_start, u_start, ux_start, traj_loss))
-        pde_loss = self.solver_config.pde_scale * self.compute_balanced_loss(traj_loss, epsilon=epsilon)
+        
         if self.model_config.use_hard_constraint:
-            return pde_loss, ((pde_loss,), key, params)
+            pde_loss, update_epsilon = self.compute_balanced_loss(traj_loss, epsilon)
+            return pde_loss, ((pde_loss,), key, params, update_epsilon)
         else:
             bc_loss = self.model_config.bc_scale * (jnp.mean((u_end - self.bc_fn(x_end))**2) + jnp.mean((ux_end - self.calc_bcx(x_end))**2))
-            return pde_loss + bc_loss, ((pde_loss, bc_loss), key, params)
+            # bc_loss = self.model_config.bc_scale * jnp.mean((u_end - self.bc_fn(x_end))**2)
+            pde_loss, update_epsilon = self.compute_balanced_loss(jnp.concatenate([traj_loss, bc_loss[None]]), epsilon)
+            return pde_loss, ((pde_loss, bc_loss), key, params, update_epsilon)
     
     # --------------------------------------------------
 
-    def nobiasfbsnn_loss(self, key, params):
+    def nobiasfbsnn1_loss(self, key, params, epsilon):
         batch = self.solver_config.micro_batch
         
         key, T, dT = self.make_time_domain(key, batch)
@@ -576,16 +600,271 @@ class Solver():
             return key, x_new1, u_calc1, ux_calc1, traj_loss
 
         key, x_end, u_end, ux_end, traj_loss = jax.lax.fori_loop(0, self.solver_config.traj_len, traj_calc, (key, x_start, u_start, ux_start, traj_loss))
-        pde_loss = self.solver_config.pde_scale * jnp.sum(traj_loss)
+
         if self.model_config.use_hard_constraint:
-            return pde_loss, ((pde_loss,), key, params)
+            pde_loss, update_epsilon = self.compute_balanced_loss(traj_loss, epsilon)
+            return pde_loss, ((pde_loss,), key, params, update_epsilon)
         else:
             bc_loss = self.model_config.bc_scale * (jnp.mean((u_end - self.bc_fn(x_end))**2) + jnp.mean((ux_end - self.calc_bcx(x_end))**2))
-            return pde_loss + bc_loss, ((pde_loss, bc_loss), key, params)
+            # bc_loss = self.model_config.bc_scale * jnp.mean((u_end - self.bc_fn(x_end))**2)
+            pde_loss, update_epsilon = self.compute_balanced_loss(jnp.concatenate([traj_loss, bc_loss[None]]), epsilon)
+            return pde_loss, ((pde_loss, bc_loss), key, params, update_epsilon)
 
     # --------------------------------------------------
 
-    def shotgun_loss(self, key, params):
+    def nobiasfbsnn2_loss(self, key, params, epsilon):
+        batch = self.solver_config.micro_batch
+        
+        key, T, dT = self.make_time_domain(key, batch)
+        key, x_start = self.get_X0(key, batch)
+        u_start, ux_start = self.calc_ux(params, T[:, 0, :], x_start)
+        traj_loss = jnp.zeros(self.solver_config.traj_len)
+
+        def traj_calc(i, inputs):
+            key, x, u, ux, traj_loss = inputs
+
+            t = T[:, i, :]
+            dt = dT[:, i, :]
+            sigma = self.sigma(t, x)
+
+            t_new = T[:, i+1, :]  # t + dt
+
+            key, sub = key.split()
+            dw1 = jnp.sqrt(dt) * jax.random.normal(sub, (batch, self.model_config.d_in))
+            x_new1 = x + self.b(t, x)*dt + jnp.matmul(sigma, dw1[..., jnp.newaxis])[..., 0]
+            u_new1 = u + self.h(t, x, u, ux)*dt + jnp.matmul(jnp.matmul(ux, sigma), dw1[..., jnp.newaxis])[..., 0]
+
+            key, sub = key.split()
+            dw2 = jnp.sqrt(dt) * jax.random.normal(sub, (batch, self.model_config.d_in))
+            x_new2_plus = x + self.b(t, x)*dt + jnp.matmul(sigma, dw2[..., jnp.newaxis])[..., 0]
+            x_new2_minus = x + self.b(t, x)*dt - jnp.matmul(sigma, dw2[..., jnp.newaxis])[..., 0]
+
+            u_calc1, ux_calc1 = self.calc_ux(params, t_new, x_new1)
+            u_calc2_plus = self.calc_u(params, t_new, x_new2_plus)
+            u_calc2_minus = self.calc_u(params, t_new, x_new2_minus)
+            traj_loss = traj_loss.at[i].set(jnp.mean((u_new1 - u_calc1)*((2*u + 2*self.h(t, x, u, ux) - u_calc2_plus - u_calc2_minus)/2)))
+
+            return key, x_new1, u_calc1, ux_calc1, traj_loss
+
+        key, x_end, u_end, ux_end, traj_loss = jax.lax.fori_loop(0, self.solver_config.traj_len, traj_calc, (key, x_start, u_start, ux_start, traj_loss))
+
+        if self.model_config.use_hard_constraint:
+            pde_loss, update_epsilon = self.compute_balanced_loss(traj_loss, epsilon)
+            return pde_loss, ((pde_loss,), key, params, update_epsilon)
+        else:
+            bc_loss = self.model_config.bc_scale * (jnp.mean((u_end - self.bc_fn(x_end))**2) + jnp.mean((ux_end - self.calc_bcx(x_end))**2))
+            # bc_loss = self.model_config.bc_scale * jnp.mean((u_end - self.bc_fn(x_end))**2)
+            pde_loss, update_epsilon = self.compute_balanced_loss(jnp.concatenate([traj_loss, bc_loss[None]]), epsilon)
+            return pde_loss, ((pde_loss, bc_loss), key, params, update_epsilon)
+    
+    # --------------------------------------------------
+
+    def nobiasfbsnn3_loss(self, key, params, epsilon):
+        batch = self.solver_config.micro_batch
+        
+        key, T, dT = self.make_time_domain(key, batch)
+        key, x_start = self.get_X0(key, batch)
+        u_start, ux_start = self.calc_ux(params, T[:, 0, :], x_start)
+        traj_loss = jnp.zeros(self.solver_config.traj_len)
+
+        def traj_calc(i, inputs):
+            key, x, u, ux, traj_loss = inputs
+
+            t = T[:, i, :]
+            dt = dT[:, i, :]
+
+            sigma = self.sigma(t, x)
+            Z_t = jnp.matmul(ux, sigma)
+            b_t = self.b(t, x)
+            h_t = self.h(t, x, u, ux)
+
+            t_new = T[:, i+1, :]  # t + dt
+
+            key, sub = key.split()
+            dw1 = jnp.sqrt(dt) * jax.random.normal(sub, (batch, self.model_config.d_in))
+            x_new1 = x + b_t*dt + jnp.matmul(sigma, dw1[..., jnp.newaxis])[..., 0]
+            u_new1 = u + h_t*dt + jnp.matmul(Z_t, dw1[..., jnp.newaxis])[..., 0]
+
+            key, sub = key.split()
+            dw2 = jnp.sqrt(dt) * jax.random.normal(sub, (batch, self.model_config.d_in))
+            x_new2 = x + b_t*dt + jnp.matmul(sigma, dw2[..., jnp.newaxis])[..., 0]
+            u_new2 = u + h_t*dt + jnp.matmul(Z_t, dw2[..., jnp.newaxis])[..., 0]
+
+            key, sub = key.split()
+            dw3 = jnp.sqrt(dt) * jax.random.normal(sub, (batch, self.model_config.d_in))
+            x_new3 = x + b_t*dt + jnp.matmul(sigma, dw3[..., jnp.newaxis])[..., 0]
+            u_new3 = u + h_t*dt + jnp.matmul(Z_t, dw3[..., jnp.newaxis])[..., 0]
+
+            u_calc1, ux_calc1 = self.calc_ux(params, t_new, x_new1)
+            u_calc2 = self.calc_u(params, t_new, x_new2)
+            u_calc3 = self.calc_u(params, t_new, x_new3)
+            traj_loss = traj_loss.at[i].set(jnp.mean((u_new1 - u_calc1)*(((u_new2 - u_calc2) + (u_new3 - u_calc3))/2)))
+
+            return key, x_new1, u_calc1, ux_calc1, traj_loss
+
+        key, x_end, u_end, ux_end, traj_loss = jax.lax.fori_loop(0, self.solver_config.traj_len, traj_calc, (key, x_start, u_start, ux_start, traj_loss))
+
+        if self.model_config.use_hard_constraint:
+            pde_loss, update_epsilon = self.compute_balanced_loss(traj_loss, epsilon)
+            return pde_loss, ((pde_loss,), key, params, update_epsilon)
+        else:
+            bc_loss = self.model_config.bc_scale * (jnp.mean((u_end - self.bc_fn(x_end))**2) + jnp.mean((ux_end - self.calc_bcx(x_end))**2))
+            # bc_loss = self.model_config.bc_scale * jnp.mean((u_end - self.bc_fn(x_end))**2)
+            pde_loss, update_epsilon = self.compute_balanced_loss(jnp.concatenate([traj_loss, bc_loss[None]]), epsilon)
+            return pde_loss, ((pde_loss, bc_loss), key, params, update_epsilon)
+        
+    # --------------------------------------------------
+
+    def nobiasfbsnn4_loss(self, key, params, epsilon):
+        batch = self.solver_config.micro_batch
+        
+        key, T, dT = self.make_time_domain(key, batch)
+        key, x_start = self.get_X0(key, batch)
+        u_start, ux_start = self.calc_ux(params, T[:, 0, :], x_start)
+        traj_loss = jnp.zeros(self.solver_config.traj_len)
+
+        def traj_calc(i, inputs):
+            key, x, u, ux, traj_loss = inputs
+
+            t = T[:, i, :]
+            dt = dT[:, i, :]
+            sigma = self.sigma(t, x)
+
+            t_new = T[:, i+1, :]  # t + dt
+
+            key, sub = key.split()
+            dw1 = jnp.sqrt(dt) * jax.random.normal(sub, (batch, self.model_config.d_in))
+            x_new1 = x + self.b(t, x)*dt + jnp.matmul(sigma, dw1[..., jnp.newaxis])[..., 0]
+            u_new1 = u + self.h(t, x, u, ux)*dt + jnp.matmul(jnp.matmul(ux, sigma), dw1[..., jnp.newaxis])[..., 0]
+
+            key, sub = key.split()
+            dw2 = jnp.sqrt(dt) * jax.random.normal(sub, (batch, self.model_config.d_in))
+            x_new2 = x + self.b(t, x)*dt + jnp.matmul(sigma, dw2[..., jnp.newaxis])[..., 0]
+            u_new2 = u + self.h(t, x, u, ux)*dt + jnp.matmul(jnp.matmul(ux, sigma), dw2[..., jnp.newaxis])[..., 0]
+
+            u_calc1, ux_calc1 = self.calc_ux(params, t_new, x_new1)
+            u_calc2 = self.calc_u(params, t_new, x_new2)
+            traj_loss = traj_loss.at[i].set(jnp.mean(jnp.max([(u_new1 - u_calc1)*(u_new2 - u_calc2), 0.0])))
+
+            return key, x_new1, u_calc1, ux_calc1, traj_loss
+
+        key, x_end, u_end, ux_end, traj_loss = jax.lax.fori_loop(0, self.solver_config.traj_len, traj_calc, (key, x_start, u_start, ux_start, traj_loss))
+
+        if self.model_config.use_hard_constraint:
+            pde_loss, update_epsilon = self.compute_balanced_loss(traj_loss, epsilon)
+            return pde_loss, ((pde_loss,), key, params, update_epsilon)
+        else:
+            bc_loss = self.model_config.bc_scale * (jnp.mean((u_end - self.bc_fn(x_end))**2) + jnp.mean((ux_end - self.calc_bcx(x_end))**2))
+            # bc_loss = self.model_config.bc_scale * jnp.mean((u_end - self.bc_fn(x_end))**2)
+            pde_loss, update_epsilon = self.compute_balanced_loss(jnp.concatenate([traj_loss, bc_loss[None]]), epsilon)
+            return pde_loss, ((pde_loss, bc_loss), key, params, update_epsilon)
+
+    # --------------------------------------------------
+
+    def nobiasfbsnn5_loss(self, key, params, epsilon):
+        batch = self.solver_config.micro_batch
+        
+        key, T, dT = self.make_time_domain(key, batch)
+        key, x_start = self.get_X0(key, batch)
+        u_start, ux_start = self.calc_ux(params, T[:, 0, :], x_start)
+        traj_loss = jnp.zeros(self.solver_config.traj_len)
+
+        def traj_calc(i, inputs):
+            key, x, u, ux, traj_loss = inputs
+
+            t = T[:, i, :]
+            dt = dT[:, i, :]
+            sigma = self.sigma(t, x)
+
+            t_new = T[:, i+1, :]  # t + dt
+
+            key, sub = key.split()
+            dw1 = jnp.sqrt(dt) * jax.random.normal(sub, (batch, self.model_config.d_in))
+            x_new1 = x + self.b(t, x)*dt + jnp.matmul(sigma, dw1[..., jnp.newaxis])[..., 0]
+            u_new1 = u + self.h(t, x, u, ux)*dt + jnp.matmul(jnp.matmul(ux, sigma), dw1[..., jnp.newaxis])[..., 0]
+
+            key, sub = key.split()
+            dw2 = jnp.sqrt(dt) * jax.random.normal(sub, (batch, self.model_config.d_in))
+            x_new2_plus = x + self.b(t, x)*dt + jnp.matmul(sigma, dw2[..., jnp.newaxis])[..., 0]
+            x_new2_minus = x + self.b(t, x)*dt - jnp.matmul(sigma, dw2[..., jnp.newaxis])[..., 0]
+
+            u_calc1, ux_calc1 = self.calc_ux(params, t_new, x_new1)
+            u_calc2_plus = self.calc_u(params, t_new, x_new2_plus)
+            u_calc2_minus = self.calc_u(params, t_new, x_new2_minus)
+            traj_loss = traj_loss.at[i].set(jnp.mean(jnp.max([(u_new1 - u_calc1)*((2*u + 2*self.h(t, x, u, ux) - u_calc2_plus - u_calc2_minus)/2), 0.0])))
+
+            return key, x_new1, u_calc1, ux_calc1, traj_loss
+
+        key, x_end, u_end, ux_end, traj_loss = jax.lax.fori_loop(0, self.solver_config.traj_len, traj_calc, (key, x_start, u_start, ux_start, traj_loss))
+
+        if self.model_config.use_hard_constraint:
+            pde_loss, update_epsilon = self.compute_balanced_loss(traj_loss, epsilon)
+            return pde_loss, ((pde_loss,), key, params, update_epsilon)
+        else:
+            bc_loss = self.model_config.bc_scale * (jnp.mean((u_end - self.bc_fn(x_end))**2) + jnp.mean((ux_end - self.calc_bcx(x_end))**2))
+            # bc_loss = self.model_config.bc_scale * jnp.mean((u_end - self.bc_fn(x_end))**2)
+            pde_loss, update_epsilon = self.compute_balanced_loss(jnp.concatenate([traj_loss, bc_loss[None]]), epsilon)
+            return pde_loss, ((pde_loss, bc_loss), key, params, update_epsilon)
+    
+    # --------------------------------------------------
+
+    def nobiasfbsnn6_loss(self, key, params, epsilon):
+        batch = self.solver_config.micro_batch
+        
+        key, T, dT = self.make_time_domain(key, batch)
+        key, x_start = self.get_X0(key, batch)
+        u_start, ux_start = self.calc_ux(params, T[:, 0, :], x_start)
+        traj_loss = jnp.zeros(self.solver_config.traj_len)
+
+        def traj_calc(i, inputs):
+            key, x, u, ux, traj_loss = inputs
+
+            t = T[:, i, :]
+            dt = dT[:, i, :]
+
+            sigma = self.sigma(t, x)
+            Z_t = jnp.matmul(ux, sigma)
+            b_t = self.b(t, x)
+            h_t = self.h(t, x, u, ux)
+
+            t_new = T[:, i+1, :]  # t + dt
+
+            key, sub = key.split()
+            dw1 = jnp.sqrt(dt) * jax.random.normal(sub, (batch, self.model_config.d_in))
+            x_new1 = x + b_t*dt + jnp.matmul(sigma, dw1[..., jnp.newaxis])[..., 0]
+            u_new1 = u + h_t*dt + jnp.matmul(Z_t, dw1[..., jnp.newaxis])[..., 0]
+
+            key, sub = key.split()
+            dw2 = jnp.sqrt(dt) * jax.random.normal(sub, (batch, self.model_config.d_in))
+            x_new2 = x + b_t*dt + jnp.matmul(sigma, dw2[..., jnp.newaxis])[..., 0]
+            u_new2 = u + h_t*dt + jnp.matmul(Z_t, dw2[..., jnp.newaxis])[..., 0]
+
+            key, sub = key.split()
+            dw3 = jnp.sqrt(dt) * jax.random.normal(sub, (batch, self.model_config.d_in))
+            x_new3 = x + b_t*dt + jnp.matmul(sigma, dw3[..., jnp.newaxis])[..., 0]
+            u_new3 = u + h_t*dt + jnp.matmul(Z_t, dw3[..., jnp.newaxis])[..., 0]
+
+            u_calc1, ux_calc1 = self.calc_ux(params, t_new, x_new1)
+            u_calc2 = self.calc_u(params, t_new, x_new2)
+            u_calc3 = self.calc_u(params, t_new, x_new3)
+            traj_loss = traj_loss.at[i].set(jnp.mean(jnp.max([(u_new1 - u_calc1)*(((u_new2 - u_calc2) + (u_new3 - u_calc3))/2), 0.0])))
+
+            return key, x_new1, u_calc1, ux_calc1, traj_loss
+
+        key, x_end, u_end, ux_end, traj_loss = jax.lax.fori_loop(0, self.solver_config.traj_len, traj_calc, (key, x_start, u_start, ux_start, traj_loss))
+
+        if self.model_config.use_hard_constraint:
+            pde_loss, update_epsilon = self.compute_balanced_loss(traj_loss, epsilon)
+            return pde_loss, ((pde_loss,), key, params, update_epsilon)
+        else:
+            bc_loss = self.model_config.bc_scale * (jnp.mean((u_end - self.bc_fn(x_end))**2) + jnp.mean((ux_end - self.calc_bcx(x_end))**2))
+            # bc_loss = self.model_config.bc_scale * jnp.mean((u_end - self.bc_fn(x_end))**2)
+            pde_loss, update_epsilon = self.compute_balanced_loss(jnp.concatenate([traj_loss, bc_loss[None]]), epsilon)
+            return pde_loss, ((pde_loss, bc_loss), key, params, update_epsilon)
+        
+    # --------------------------------------------------
+
+    def shotgun_loss(self, key, params, epsilon):
         batch = self.solver_config.micro_batch
         
         key, T, dT = self.make_time_domain(key, batch)
@@ -634,16 +913,19 @@ class Solver():
             return key, x_new, u_calc, ux_calc, step_loss
         
         key, x_end, u_end, ux_end, step_loss = jax.lax.fori_loop(0, self.solver_config.traj_len, traj_calc, (key, x_start, u_start, ux_start, step_loss))
-        pde_loss = self.solver_config.pde_scale * jnp.mean(step_loss)
+
         if self.model_config.use_hard_constraint:
-            return pde_loss, ((pde_loss,), key, params)
+            pde_loss, update_epsilon = self.compute_balanced_loss(step_loss, epsilon)
+            return pde_loss, ((pde_loss,), key, params, update_epsilon)
         else:
             bc_loss = self.model_config.bc_scale * (jnp.mean((u_end - self.bc_fn(x_end))**2) + jnp.mean((ux_end - self.calc_bcx(x_end))**2))
-            return pde_loss + bc_loss, ((pde_loss, bc_loss), key, params)
+            # bc_loss = self.model_config.bc_scale * jnp.mean((u_end - self.bc_fn(x_end))**2)
+            pde_loss, update_epsilon = self.compute_balanced_loss(jnp.concatenate([step_loss, bc_loss[None]]), epsilon)
+            return pde_loss, ((pde_loss, bc_loss), key, params, update_epsilon)
     
     # --------------------------------------------------
     
-    def nobiasshotgun_loss(self, key, params):
+    def nobiasshotgun1_loss(self, key, params, epsilon):
         batch = self.solver_config.micro_batch
         
         key, T, dT = self.make_time_domain(key, batch)
@@ -695,10 +977,6 @@ class Solver():
             step_loss = step_loss.at[i].set(
                 jnp.mean(jnp.mean((u_plus.reshape(batch, local_batch) + u_minus.reshape(batch, local_batch) - 2*u_local)/(2*Delta_t) - h_local, axis=-1)**2)
             )
-            # step_loss = step_loss.at[i].set(
-            #     jnp.mean(jnp.mean(((u_plus.reshape(batch, local_batch)[:, 0::2] + u_minus.reshape(batch, local_batch)[:, 0::2] - 2*u_local[:, 0::2])/(2*Delta_t) - h_local[:, ::2])*
-            #                       ((u_plus.reshape(batch, local_batch)[:, 1::2] + u_minus.reshape(batch, local_batch)[:, 1::2] - 2*u_local[:, 1::2])/(2*Delta_t) - h_local[:, ::2]), axis=-1)**2)
-            # )
 
             key, sub = key.split()
             dw = jnp.sqrt(dt) * jax.random.normal(sub, (batch, self.model_config.d_in))
@@ -712,12 +990,259 @@ class Solver():
             return key, x_new, u_calc, ux_calc, step_loss
         
         key, x_end, u_end, ux_end, step_loss = jax.lax.fori_loop(0, self.solver_config.traj_len, traj_calc, (key, x_start, u_start, ux_start, step_loss))
-        pde_loss = self.solver_config.pde_scale * jnp.mean(step_loss)
+
         if self.model_config.use_hard_constraint:
-            return pde_loss, ((pde_loss,), key, params)
+            pde_loss, update_epsilon = self.compute_balanced_loss(step_loss, epsilon)
+            return pde_loss, ((pde_loss,), key, params, update_epsilon)
         else:
             bc_loss = self.model_config.bc_scale * (jnp.mean((u_end - self.bc_fn(x_end))**2) + jnp.mean((ux_end - self.calc_bcx(x_end))**2))
-            return pde_loss + bc_loss, ((pde_loss, bc_loss), key, params)
+            # bc_loss = self.model_config.bc_scale * jnp.mean((u_end - self.bc_fn(x_end))**2)
+            pde_loss, update_epsilon = self.compute_balanced_loss(jnp.concatenate([step_loss, bc_loss[None]]), epsilon)
+            return pde_loss, ((pde_loss, bc_loss), key, params, update_epsilon)
+        
+    # ---------------------
+
+    def nobiasshotgun2_loss(self, key, params, epsilon):
+        batch = self.solver_config.micro_batch
+        
+        key, T, dT = self.make_time_domain(key, batch)
+        key, x_start = self.get_X0(key, batch)
+        u_start, ux_start = self.calc_ux(params, T[:, 0, :], x_start)
+        step_loss = jnp.zeros(self.solver_config.traj_len)
+        
+        Delta_t = self.solver_config.shotgun_Delta_t
+        local_batch = self.solver_config.shotgun_local_batch
+        d_in = self.model_config.d_in
+        
+        def traj_calc(i, inputs):
+            key, x, u, ux, step_loss = inputs
+
+            t = T[:, i, :]
+            dt = dT[:, i, :]
+            sigma = self.sigma(t, x)
+            
+            t_local = jnp.broadcast_to(t[:, jnp.newaxis, :] + Delta_t, (batch, local_batch, 1))
+            x_local = jnp.broadcast_to((x + self.b(t, x)*Delta_t)[:, jnp.newaxis, :], (batch, local_batch, d_in))
+            u_local = jnp.broadcast_to(u[:, jnp.newaxis, 0], (batch, local_batch))
+            h_local = jnp.broadcast_to(self.h(t, x, u, ux)[:, jnp.newaxis, 0], (batch, local_batch))
+
+            key, sub = key.split()
+            eta = jnp.sqrt(Delta_t) * jax.random.normal(sub, (batch, local_batch, d_in))
+
+            diff = jnp.einsum('bij,bkj->bki', sigma, eta)
+            x_plus = x_local + diff
+            x_minus = x_local - diff
+            
+            u_plus = self.calc_u(params, t_local.reshape(-1, 1), x_plus.reshape(-1, d_in)).reshape(batch, local_batch)
+            u_minus = self.calc_u(params, t_local.reshape(-1, 1), x_minus.reshape(-1, d_in)).reshape(batch, local_batch)
+            step_loss = step_loss.at[i].set(
+                jnp.mean(jnp.mean((u_plus[..., ::2] + u_minus[..., ::2] - 2*u_local[..., ::2])/(2*Delta_t) - h_local[..., ::2], axis=-1)*
+                         jnp.mean((u_plus[..., 1::2] + u_minus[..., 1::2] - 2*u_local[..., 1::2])/(2*Delta_t) - h_local[..., 1::2], axis=-1))
+            )
+
+            key, sub = key.split()
+            dw = jnp.sqrt(dt) * jax.random.normal(sub, (batch, self.model_config.d_in))
+
+            t_new = T[:, i+1, :]  # t + dt 
+            x_new = x + self.b(t, x)*dt + jnp.matmul(sigma, dw[..., jnp.newaxis])[..., 0]
+            # u_new = u + self.h(t, x, u, ux)*dt + jnp.matmul(jnp.matmul(ux, sigma), dw[..., jnp.newaxis])[..., 0]
+
+            u_calc, ux_calc = self.calc_ux(params, t_new, x_new)
+                
+            return key, x_new, u_calc, ux_calc, step_loss
+        
+        key, x_end, u_end, ux_end, step_loss = jax.lax.fori_loop(0, self.solver_config.traj_len, traj_calc, (key, x_start, u_start, ux_start, step_loss))
+
+        if self.model_config.use_hard_constraint:
+            pde_loss, update_epsilon = self.compute_balanced_loss(step_loss, epsilon)
+            return pde_loss, ((pde_loss,), key, params, update_epsilon)
+        else:
+            bc_loss = self.model_config.bc_scale * (jnp.mean((u_end - self.bc_fn(x_end))**2) + jnp.mean((ux_end - self.calc_bcx(x_end))**2))
+            # bc_loss = self.model_config.bc_scale * jnp.mean((u_end - self.bc_fn(x_end))**2)
+            pde_loss, update_epsilon = self.compute_balanced_loss(jnp.concatenate([step_loss, bc_loss[None]]), epsilon)
+            return pde_loss, ((pde_loss, bc_loss), key, params, update_epsilon)
+    
+    # ---------------------
+
+    def nobiasshotgun3_loss(self, key, params, epsilon):
+        batch = self.solver_config.micro_batch
+        
+        key, T, dT = self.make_time_domain(key, batch)
+        key, x_start = self.get_X0(key, batch)
+        u_start, ux_start = self.calc_ux(params, T[:, 0, :], x_start)
+        step_loss = jnp.zeros(self.solver_config.traj_len)
+        
+        Delta_t = self.solver_config.shotgun_Delta_t
+        local_batch = self.solver_config.shotgun_local_batch
+        d_in = self.model_config.d_in
+        
+        def traj_calc(i, inputs):
+            key, x, u, ux, step_loss = inputs
+
+            t = T[:, i, :]
+            dt = dT[:, i, :]
+            sigma = self.sigma(t, x)
+            
+            t_local = jnp.broadcast_to(t[:, jnp.newaxis, :] + Delta_t, (batch, local_batch, 1))
+            x_local = jnp.broadcast_to((x + self.b(t, x)*Delta_t)[:, jnp.newaxis, :], (batch, local_batch, d_in))
+            u_local = jnp.broadcast_to(u[:, jnp.newaxis, 0], (batch, local_batch))
+            h_local = jnp.broadcast_to(self.h(t, x, u, ux)[:, jnp.newaxis, 0], (batch, local_batch))
+
+            key, sub = key.split()
+            eta = jnp.sqrt(Delta_t) * jax.random.normal(sub, (batch, local_batch, d_in))
+
+            x_star = x_local + jnp.einsum('bij,bkj->bki', sigma, eta)
+            u_star = u_local + h_local*Delta_t + jnp.einsum('bij,bkj->bki', jnp.matmul(ux, sigma), eta)
+            u_star_calc = self.calc_u(params, t_local.reshape(-1, 1), x_star.reshape(-1, d_in)).reshape(batch, local_batch)
+
+            step_loss = step_loss.at[i].set(
+                jnp.mean(jnp.mean(u_star[..., ::2] - u_star_calc[..., ::2], axis=-1)*
+                         jnp.mean(u_star[..., 1::2] - u_star_calc[..., 1::2], axis=-1))
+            )
+
+            key, sub = key.split()
+            dw = jnp.sqrt(dt) * jax.random.normal(sub, (batch, self.model_config.d_in))
+
+            t_new = T[:, i+1, :]  # t + dt 
+            x_new = x + self.b(t, x)*dt + jnp.matmul(sigma, dw[..., jnp.newaxis])[..., 0]
+            # u_new = u + self.h(t, x, u, ux)*dt + jnp.matmul(jnp.matmul(ux, sigma), dw[..., jnp.newaxis])[..., 0]
+
+            u_calc, ux_calc = self.calc_ux(params, t_new, x_new)
+                
+            return key, x_new, u_calc, ux_calc, step_loss
+        
+        key, x_end, u_end, ux_end, step_loss = jax.lax.fori_loop(0, self.solver_config.traj_len, traj_calc, (key, x_start, u_start, ux_start, step_loss))
+
+        if self.model_config.use_hard_constraint:
+            pde_loss, update_epsilon = self.compute_balanced_loss(step_loss, epsilon)
+            return pde_loss, ((pde_loss,), key, params, update_epsilon)
+        else:
+            bc_loss = self.model_config.bc_scale * (jnp.mean((u_end - self.bc_fn(x_end))**2) + jnp.mean((ux_end - self.calc_bcx(x_end))**2))
+            # bc_loss = self.model_config.bc_scale * jnp.mean((u_end - self.bc_fn(x_end))**2)
+            pde_loss, update_epsilon = self.compute_balanced_loss(jnp.concatenate([step_loss, bc_loss[None]]), epsilon)
+            return pde_loss, ((pde_loss, bc_loss), key, params, update_epsilon)
+        
+    # ---------------------
+
+    def nobiasshotgun4_loss(self, key, params, epsilon):
+        batch = self.solver_config.micro_batch
+        
+        key, T, dT = self.make_time_domain(key, batch)
+        key, x_start = self.get_X0(key, batch)
+        u_start, ux_start = self.calc_ux(params, T[:, 0, :], x_start)
+        step_loss = jnp.zeros(self.solver_config.traj_len)
+        
+        Delta_t = self.solver_config.shotgun_Delta_t
+        local_batch = self.solver_config.shotgun_local_batch
+        d_in = self.model_config.d_in
+        
+        def traj_calc(i, inputs):
+            key, x, u, ux, step_loss = inputs
+
+            t = T[:, i, :]
+            dt = dT[:, i, :]
+            sigma = self.sigma(t, x)
+            
+            t_local = jnp.broadcast_to(t[:, jnp.newaxis, :] + Delta_t, (batch, local_batch, 1))
+            x_local = jnp.broadcast_to((x + self.b(t, x)*Delta_t)[:, jnp.newaxis, :], (batch, local_batch, d_in))
+            u_local = jnp.broadcast_to(u[:, jnp.newaxis, 0], (batch, local_batch))
+            h_local = jnp.broadcast_to(self.h(t, x, u, ux)[:, jnp.newaxis, 0], (batch, local_batch))
+
+            key, sub = key.split()
+            eta = jnp.sqrt(Delta_t) * jax.random.normal(sub, (batch, local_batch, d_in))
+
+            diff = jnp.einsum('bij,bkj->bki', sigma, eta)
+            x_plus = x_local + diff
+            x_minus = x_local - diff
+            
+            u_plus = self.calc_u(params, t_local.reshape(-1, 1), x_plus.reshape(-1, d_in)).reshape(batch, local_batch)
+            u_minus = self.calc_u(params, t_local.reshape(-1, 1), x_minus.reshape(-1, d_in)).reshape(batch, local_batch)
+            step_loss = step_loss.at[i].set(
+                jnp.mean(nn.relu(jnp.mean((u_plus[..., ::2] + u_minus[..., ::2] - 2*u_local[..., ::2])/(2*Delta_t) - h_local[..., ::2], axis=-1)*
+                                 jnp.mean((u_plus[..., 1::2] + u_minus[..., 1::2] - 2*u_local[..., 1::2])/(2*Delta_t) - h_local[..., 1::2], axis=-1)))
+            )
+
+            key, sub = key.split()
+            dw = jnp.sqrt(dt) * jax.random.normal(sub, (batch, self.model_config.d_in))
+
+            t_new = T[:, i+1, :]  # t + dt 
+            x_new = x + self.b(t, x)*dt + jnp.matmul(sigma, dw[..., jnp.newaxis])[..., 0]
+            # u_new = u + self.h(t, x, u, ux)*dt + jnp.matmul(jnp.matmul(ux, sigma), dw[..., jnp.newaxis])[..., 0]
+
+            u_calc, ux_calc = self.calc_ux(params, t_new, x_new)
+                
+            return key, x_new, u_calc, ux_calc, step_loss
+        
+        key, x_end, u_end, ux_end, step_loss = jax.lax.fori_loop(0, self.solver_config.traj_len, traj_calc, (key, x_start, u_start, ux_start, step_loss))
+        
+        if self.model_config.use_hard_constraint:
+            pde_loss, update_epsilon = self.compute_balanced_loss(step_loss, epsilon)
+            return pde_loss, ((pde_loss,), key, params, update_epsilon)
+        else:
+            bc_loss = self.model_config.bc_scale * (jnp.mean((u_end - self.bc_fn(x_end))**2) + jnp.mean((ux_end - self.calc_bcx(x_end))**2))
+            # bc_loss = self.model_config.bc_scale * jnp.mean((u_end - self.bc_fn(x_end))**2)
+            pde_loss, update_epsilon = self.compute_balanced_loss(jnp.concatenate([step_loss, bc_loss[None]]), epsilon)
+            return pde_loss, ((pde_loss, bc_loss), key, params, update_epsilon)
+    
+    # ---------------------
+
+    def nobiasshotgun5_loss(self, key, params, epsilon):
+        batch = self.solver_config.micro_batch
+        
+        key, T, dT = self.make_time_domain(key, batch)
+        key, x_start = self.get_X0(key, batch)
+        u_start, ux_start = self.calc_ux(params, T[:, 0, :], x_start)
+        step_loss = jnp.zeros(self.solver_config.traj_len)
+        
+        Delta_t = self.solver_config.shotgun_Delta_t
+        local_batch = self.solver_config.shotgun_local_batch
+        d_in = self.model_config.d_in
+        
+        def traj_calc(i, inputs):
+            key, x, u, ux, step_loss = inputs
+
+            t = T[:, i, :]
+            dt = dT[:, i, :]
+            sigma = self.sigma(t, x)
+            
+            t_local = jnp.broadcast_to(t[:, jnp.newaxis, :] + Delta_t, (batch, local_batch, 1))
+            x_local = jnp.broadcast_to((x + self.b(t, x)*Delta_t)[:, jnp.newaxis, :], (batch, local_batch, d_in))
+            u_local = jnp.broadcast_to(u[:, jnp.newaxis, 0], (batch, local_batch))
+            h_local = jnp.broadcast_to(self.h(t, x, u, ux)[:, jnp.newaxis, 0], (batch, local_batch))
+
+            key, sub = key.split()
+            eta = jnp.sqrt(Delta_t) * jax.random.normal(sub, (batch, local_batch, d_in))
+
+            x_star = x_local + jnp.einsum('bij,bkj->bki', sigma, eta)
+            u_star = u_local + h_local*Delta_t + jnp.einsum('bij,bkj->bki', jnp.matmul(ux, sigma), eta)
+            u_star_calc = self.calc_u(params, t_local.reshape(-1, 1), x_star.reshape(-1, d_in)).reshape(batch, local_batch)
+
+            step_loss = step_loss.at[i].set(
+                jnp.mean(nn.relu(jnp.mean(u_star[..., ::2] - u_star_calc[..., ::2], axis=-1)*
+                                 jnp.mean(u_star[..., 1::2] - u_star_calc[..., 1::2], axis=-1)))
+            )
+
+            key, sub = key.split()
+            dw = jnp.sqrt(dt) * jax.random.normal(sub, (batch, self.model_config.d_in))
+
+            t_new = T[:, i+1, :]  # t + dt 
+            x_new = x + self.b(t, x)*dt + jnp.matmul(sigma, dw[..., jnp.newaxis])[..., 0]
+            # u_new = u + self.h(t, x, u, ux)*dt + jnp.matmul(jnp.matmul(ux, sigma), dw[..., jnp.newaxis])[..., 0]
+
+            u_calc, ux_calc = self.calc_ux(params, t_new, x_new)
+                
+            return key, x_new, u_calc, ux_calc, step_loss
+        
+        key, x_end, u_end, ux_end, step_loss = jax.lax.fori_loop(0, self.solver_config.traj_len, traj_calc, (key, x_start, u_start, ux_start, step_loss))
+
+        if self.model_config.use_hard_constraint:
+            pde_loss, update_epsilon = self.compute_balanced_loss(step_loss, epsilon)
+            return pde_loss, ((pde_loss,), key, params, update_epsilon)
+        else:
+            bc_loss = self.model_config.bc_scale * (jnp.mean((u_end - self.bc_fn(x_end))**2) + jnp.mean((ux_end - self.calc_bcx(x_end))**2))
+            # bc_loss = self.model_config.bc_scale * jnp.mean((u_end - self.bc_fn(x_end))**2)
+            pde_loss, update_epsilon = self.compute_balanced_loss(jnp.concatenate([step_loss, bc_loss[None]]), epsilon)
+            return pde_loss, ((pde_loss, bc_loss), key, params, update_epsilon)
 
     # --------------------------------------------------
     # Plot Methods
@@ -758,17 +1283,18 @@ class Solver():
         L1 = jnp.mean(jnp.abs(pred - true) / jnp.abs(true), axis=1)
         L2 = jnp.sqrt(jnp.mean(((pred - true) ** 2) / (true ** 2), axis=1))
 
-        fig_pred = plt.figure(figsize=(5, 3))
+        fig_pred = plt.figure(figsize=(10, 6))
         plt.plot(time[:, :4], pred[:, :4], "r", linewidth=1)
         plt.plot(time[:, :4], true[:, :4], ":b", linewidth=1)
         plt.title('Prediction') 
         plt.close(fig_pred)
         wandb.log({'Prediction': wandb.Image(fig_pred)}, step=i)
 
-        fig_L1 = plt.figure(figsize=(5, 3))
+        fig_L1 = plt.figure(figsize=(10, 6))
         plt.plot(time[:, 0], L1, "b", linewidth=1)
         plt.title('L1 Error')
         plt.yscale('log')
+        plt.ylim(1e-4, 1e-1)
         plt.close(fig_L1)
         wandb.log({'L1 Error': wandb.Image(fig_L1)}, step=i)
 
@@ -776,6 +1302,7 @@ class Solver():
         plt.plot(time[:, 0], L2, "b", linewidth=1)
         plt.title('L2 Error')
         plt.yscale('log')
+        plt.ylim(1e-4, 1e-1)
         plt.close(fig_L2)
         wandb.log({'L2 Error': wandb.Image(fig_L2)}, step=i)
 
@@ -822,12 +1349,12 @@ class Solver():
     
     @partial(jax.jit, static_argnums=0)
     def optimize(self, key, params, opt_state, epsilon):
-        key, params, losses, grad = self.grad_fn(key, params, epsilon)
+        key, params, losses, grad, update_epsilon = self.grad_fn(key, params, epsilon)
         loss = jnp.sum(jnp.asarray(losses))
         updates, opt_state = self.optimizer.update(grad, opt_state)
         params = optax.apply_updates(params, updates)
 
-        return key, loss, losses, params, opt_state
+        return key, loss, losses, params, opt_state, update_epsilon
 
 
 
@@ -841,20 +1368,19 @@ class Controller():
         self.solver = solver
         self.key = Key(jax.random.PRNGKey(seed))
         self.key, self.params, self.opt_state = self.solver.init_solver(self.key)
-        self.S = self.solver.solver_config.iter // len(self.solver.solver_config.epsilons)
-        self.causal_step = 0
+        self.epsilon = self.solver.solver_config.start_epsilon
 
     def step(self, i):
-        if self.solver.solver_config.causal_training:
-            if i > 0 and i%(self.S) == 0:
-                self.causal_step = self.causal_step + 1
-            epsilon = jnp.asarray(self.solver.solver_config.epsilons[self.causal_step], dtype=jnp.float32)
-            self.key, loss, losses, self.params, self.opt_state = self.solver.optimize(self.key, self.params, self.opt_state, epsilon=epsilon)
-        else:
-            self.key, loss, losses, self.params, self.opt_state = self.solver.optimize(self.key, self.params, self.opt_state, epsilon=0)
+
+        self.key, loss, losses, self.params, self.opt_state, update_epsilon = self.solver.optimize(self.key, self.params, self.opt_state, self.epsilon)
+        if update_epsilon and i < self.solver.solver_config.iter//2:
+            self.epsilon = self.epsilon * self.solver.solver_config.exp_epsilon
 
         if self.solver.solver_config.save_to_wandb:
             wandb.log({'loss': loss, **{'loss'+str(k+1): v for k, v in dict(enumerate(losses)).items()}}, step=i)
+            
+            if self.solver.solver_config.causal_training:
+                wandb.log({'epsilon': self.epsilon}, step=i)
 
             pred_T0, RL_T0 = self.solver.jit_calc_RL_T0(self.params)
             wandb.log({'pred_T0': pred_T0, "RL_T0": RL_T0}, step=i)
@@ -862,7 +1388,7 @@ class Controller():
             if self.solver.solver_config.custom_eval:
                 custom_eval = self.solver.jit_calc_eval(self.params)
                 wandb.log({"eval": custom_eval}, step=i)
-            if i%(self.solver.solver_config.iter//self.solver.solver_config.num_figures) == 0:
+            if i%(self.solver.solver_config.iter//self.solver.solver_config.num_figures) == 0 or i+1 == self.solver.solver_config.iter:
                 RL1, RL2 = self.solver.jit_calc_RL(self.params)
                 wandb.log({"RL1": RL1, "RL2": RL2}, step=i)   
                 self.solver.plot_pred(self.params, i)

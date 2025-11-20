@@ -69,8 +69,9 @@ class Solver_Config():
 
     # loss balancing
     causal_training: bool = False
-    epsilons: list = field(default_factory=lambda: [1e-2, 1e-1, 1.0, 10.0, 100.0])
-    delta: float = 0.99
+    start_epsilon: float = 1.0
+    exp_epsilon: float = 2.0
+    delta_epsilon: float = 0.99
 
     # shotgun setting
     shotgun_local_batch: int = 64
